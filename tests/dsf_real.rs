@@ -29,3 +29,34 @@ fn parses_real_eruption_id3v23_utf16() {
     assert_eq!(tags.artist.as_deref(), Some("Van Halen"));
     assert_eq!(tags.album.as_deref(), Some("Van Halen"));
 }
+
+#[test]
+fn parses_real_cc0_goldberg_header_with_bogus_pointers() {
+    // decaud.io CC0 sampler: header has total_size=28 and fmt pointer past
+    // EOF, but the real `fmt ` chunk sits at offset 28.
+    let bytes = include_bytes!("fixtures/goldberg_header.bin");
+    let info = dsf::parse_bytes(bytes, Path::new("goldberg.dsf")).unwrap();
+    assert_eq!(info.sample_rate, 2_822_400);
+    assert_eq!(info.channels, 2);
+    assert_eq!(info.samples_per_channel, 265_870_080);
+    assert_eq!(info.data_offset, 92);
+    assert_eq!(info.sacd_frames(), 7065);
+}
+
+#[test]
+fn parses_real_cc0_goldberg_id3() {
+    let mut bytes = include_bytes!("fixtures/goldberg_header.bin").to_vec();
+    bytes.extend_from_slice(include_bytes!("fixtures/goldberg_id3.bin"));
+    let tags = id3::parse_id3_tail(&bytes[92..], Path::new("goldberg.dsf"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tags.title.as_deref(),
+        Some("Variatio 5 a 1 ovvero 2 Clav. (DSD64)")
+    );
+    assert_eq!(tags.artist.as_deref(), Some("Kimiko Ishizaka"));
+    assert_eq!(
+        tags.album.as_deref(),
+        Some("The Open Goldberg Variations (Decaud DSD Sampler)")
+    );
+}
