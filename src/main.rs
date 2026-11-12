@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use sacd_author::dsf;
+use sacd_author::{dsf, image};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -43,6 +43,28 @@ fn main() -> Result<()> {
             println!("  album:  {album}");
         }
     }
-    println!("output: {}", cli.output.display());
+    let infos: Vec<_> = cli
+        .inputs
+        .iter()
+        .map(|p| dsf::parse(p).with_context(|| format!("failed to parse {}", p.display())))
+        .collect::<Result<_>>()?;
+    println!("writing {} ...", cli.output.display());
+    let summary = image::build_image(&infos, &cli.output)
+        .with_context(|| format!("failed to write {}", cli.output.display()))?;
+    println!(
+        "done: {} sectors total, {} audio sectors, {} track(s)",
+        summary.total_sectors,
+        summary.audio_sectors,
+        summary.layouts.len()
+    );
+    for (i, layout) in summary.layouts.iter().enumerate() {
+        println!(
+            "  track {}: LBA {} ({} sectors, {} frames)",
+            i + 1,
+            image::AUDIO_START_LBA + layout.start_sector,
+            layout.sector_count,
+            layout.frames
+        );
+    }
     Ok(())
 }
