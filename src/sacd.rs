@@ -8,8 +8,9 @@
 //! packetized (Scarlet Book, see sacd-ripper's scarletbook.h):
 //! - byte 0: sector header — bit0 dst_encoded, bit1 reserved,
 //!   bits 2-4 frame_info_count, bits 5-7 packet_info_count
-//! - then packet_info_count * 2 bytes packet info — bit0 frame_start,
-//!   bits 2-4 data_type (2 = audio), bits 5-15 packet_length (11 bits)
+//! - then packet_info_count * 2 bytes packet info (big-endian bitfield, as
+//!   decoded by sacd-ripper: `(b0 & 7) << 8 | b1`) — bit7 frame_start,
+//!   bits 3-5 data_type (2 = audio), bits 0-10 packet_length (11 bits)
 //! - then frame_info_count * 3 bytes frame timecode (minutes, seconds,
 //!   frames @75fps); present on the first sector of each audio frame only
 //! - then packet_length bytes of DSD payload
@@ -82,7 +83,7 @@ fn emit_frame(out: &mut impl Write, idx: u64, data: &[u8]) -> std::io::Result<()
         let header_len = 1 + 2 + if first { 3 } else { 0 };
         let len = (data.len() - pos).min(SECTOR_SIZE - header_len);
         let frame_start: u8 = if first { 1 } else { 0 };
-        sector[1] = frame_start | (DATA_TYPE_AUDIO << 2) | (((len >> 8) & 0x07) as u8) << 5;
+        sector[1] = (frame_start << 7) | (DATA_TYPE_AUDIO << 3) | ((len >> 8) as u8 & 0x07);
         sector[2] = (len & 0xFF) as u8;
         if first {
             sector[3] = m;
@@ -234,21 +235,21 @@ mod tests {
         let mut out = Vec::new();
         emit_frame(&mut out, 75, &data).unwrap();
         assert_eq!(out.len(), 5 * SECTOR_SIZE);
-        // sector 0: header 0x24, packet info frame_start=1 data_type=2 len=2042
+        // sector 0: header 0x24, packet info (BE bitfield) frame_start=1 data_type=2 len=2042
         assert_eq!(out[0], 0x24);
-        assert_eq!(out[1], 0x01 | (2 << 2) | (7 << 5)); // len 2042 = 0x7FA
+        assert_eq!(out[1], (1 << 7) | (2 << 3) | 7); // len 2042 = 0x7FA
         assert_eq!(out[2], 0xFA);
         assert_eq!(&out[3..6], &[0, 1, 0]); // timecode of frame 75 = 0:01:00
         assert!(out[6..6 + 2042].iter().all(|&b| b == 0xAB));
         // sector 1: header 0x20, frame_start=0, len=2045
         let s1 = SECTOR_SIZE;
         assert_eq!(out[s1], 0x20);
-        assert_eq!(out[s1 + 1], (2 << 2) | (7 << 5));
+        assert_eq!(out[s1 + 1], (2 << 3) | 7); // len 2045 = 0x7FD
         assert_eq!(out[s1 + 2], 0xFD);
         // last sector: len = 9408 - 2042 - 3*2045 = 1231 = 0x4CF
         let s4 = 4 * SECTOR_SIZE;
         assert_eq!(out[s4], 0x20);
-        assert_eq!(out[s4 + 1], (2 << 2) | (4 << 5));
+        assert_eq!(out[s4 + 1], (2 << 3) | 4); // len 1231 = 0x4CF
         assert_eq!(out[s4 + 2], 0xCF);
         assert!(out[s4 + 3..].iter().all(|&b| b == 0 || b == 0xAB));
     }
