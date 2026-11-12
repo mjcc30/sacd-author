@@ -41,3 +41,12 @@ Re-download it with `scripts/fetch_test_sample.sh`. Regenerate the demo image:
 ```bash
 sacd-author samples/goldberg-var5-dsd64.dsf -o goldberg.iso
 ```
+
+## Multi-track demo album
+
+```bash
+scripts/fetch_album_samples.sh samples/   # downloads 2 more CC BY-NC-SA tracks (sha256-checked)
+sacd-author samples/goldberg-var5-dsd64.dsf samples/decada-lounge-fashioned.dsf \
+    samples/decada-una-sensacion.dsf -o album.iso
+```
+See `samples/README.md`.
