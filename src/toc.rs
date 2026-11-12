@@ -73,7 +73,7 @@
 //!   (minutes, seconds, frames, flags)
 
 use crate::sacd::TrackLayout;
-use binrw::{BinRead, BinWrite, BinWriterExt, binrw};
+use binrw::{BinWrite, binrw};
 use std::io::Cursor;
 
 pub const SECTOR_SIZE: usize = 2048;
