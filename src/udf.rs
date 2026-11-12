@@ -57,7 +57,7 @@ pub fn make_tag(id: u16, version: u16, location: u32, body: &[u8]) -> [u8; 16] {
     let sum: u8 = t[0..4]
         .iter()
         .chain(t[5..16].iter())
-        .map(|&b| b)
+        .copied()
         .fold(0u8, |a, b| a.wrapping_add(b));
     t[4] = sum;
     t
