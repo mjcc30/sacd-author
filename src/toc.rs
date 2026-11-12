@@ -196,6 +196,32 @@ impl Default for MasterToc {
     }
 }
 
+/// One `SACDText` sector of the master TOC (all text positions = 0).
+pub fn master_sacd_text_sector() -> Vec<u8> {
+    let mut s = vec![0u8; SECTOR_SIZE];
+    s[0..8].copy_from_slice(b"SACDText");
+    s
+}
+
+/// The `SACD_Man` (manufacturer info) sector of the master TOC.
+pub fn master_man_sector() -> Vec<u8> {
+    let mut s = vec![0u8; SECTOR_SIZE];
+    s[0..8].copy_from_slice(b"SACD_Man");
+    s
+}
+
+/// Full 10-sector master TOC area: SACDMTOC header + 8 SACDText sectors
+/// (one per locale) + SACD_Man. Readers such as foo_input_sacd require all
+/// three magics to be present.
+pub fn master_toc_area() -> Vec<u8> {
+    let mut out = MasterToc::new().to_sector();
+    for _ in 0..8 {
+        out.extend_from_slice(&master_sacd_text_sector());
+    }
+    out.extend_from_slice(&master_man_sector());
+    out
+}
+
 #[binrw]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[brw(big)]
@@ -453,5 +479,16 @@ mod tests {
         let mut cursor = Cursor::new(&bytes);
         let parsed: MasterToc = cursor.read_be().unwrap();
         assert_eq!(parsed, toc);
+    }
+
+    #[test]
+    fn master_toc_area_has_text_and_man_sectors() {
+        let area = master_toc_area();
+        assert_eq!(area.len(), 10 * SECTOR_SIZE);
+        assert_eq!(&area[0..8], b"SACDMTOC");
+        for i in 1..9 {
+            assert_eq!(&area[i * SECTOR_SIZE..i * SECTOR_SIZE + 8], b"SACDText");
+        }
+        assert_eq!(&area[9 * SECTOR_SIZE..9 * SECTOR_SIZE + 8], b"SACD_Man");
     }
 }

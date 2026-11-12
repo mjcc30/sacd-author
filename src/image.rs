@@ -30,7 +30,7 @@
 use crate::dsf::DsfInfo;
 use crate::iso9660 as iso;
 use crate::sacd::{self, TrackLayout};
-use crate::toc::{self, MasterToc};
+use crate::toc;
 use crate::udf::{self, SECTOR};
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
@@ -317,30 +317,15 @@ pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageS
     write_sector(&mut file, UDF_SACD_FIDS_LBA, &sacd_fids)?;
 
     // --- Scarlet Book TOCs (raw sectors) ---
-    let master = MasterToc::new().to_sector();
-    for lba in toc::START_OF_MASTER_TOC..toc::START_OF_MASTER_TOC + toc::MASTER_TOC_LEN {
-        let data = if lba == toc::START_OF_MASTER_TOC {
-            &master
-        } else {
-            &[0u8; SECTOR][..]
-        };
-        write_sector(&mut file, lba, data)?;
-    }
-    for lba in toc::MASTER_TOC_2_START..toc::MASTER_TOC_2_START + toc::MASTER_TOC_LEN {
-        let data = if lba == toc::MASTER_TOC_2_START {
-            &master
-        } else {
-            &[0u8; SECTOR][..]
-        };
-        write_sector(&mut file, lba, data)?;
-    }
-    for lba in toc::MASTER_TOC_3_START..toc::MASTER_TOC_3_START + toc::MASTER_TOC_LEN {
-        let data = if lba == toc::MASTER_TOC_3_START {
-            &master
-        } else {
-            &[0u8; SECTOR][..]
-        };
-        write_sector(&mut file, lba, data)?;
+    let master_area = toc::master_toc_area();
+    for base in [
+        toc::START_OF_MASTER_TOC,
+        toc::MASTER_TOC_2_START,
+        toc::MASTER_TOC_3_START,
+    ] {
+        for (i, chunk) in master_area.chunks(SECTOR).enumerate() {
+            write_sector(&mut file, base + i as u32, chunk)?;
+        }
     }
     let area_toc = toc::build_area_toc(&layouts, AUDIO_START_LBA);
     for (i, chunk) in area_toc.chunks(SECTOR).enumerate() {
@@ -406,6 +391,8 @@ mod tests {
         assert_eq!(&at_510, b"SACDMTOC");
         let sector = read_at(iso.path(), 510, SECTOR);
         assert_eq!(&sector[0x40..0x44], &544u32.to_be_bytes());
+        assert_eq!(read_at(iso.path(), 511, 8), b"SACDText");
+        assert_eq!(read_at(iso.path(), 519, 8), b"SACD_Man");
     }
 
     #[test]
