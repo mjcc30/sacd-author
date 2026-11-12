@@ -47,17 +47,25 @@ pub struct TrackLayout {
     pub frames: u64,
 }
 
+/// Number of audio frames actually emitted for a track: the interleaved
+/// stream is block_count * 8192 bytes, packed into frames of FRAME_DATA_BYTES.
+pub fn stream_frames(info: &DsfInfo) -> u64 {
+    // convert_track reads whole block pairs (padded), so the emitted stream is
+    // ceil(data_size / 8192) pairs of 8192 bytes.
+    let pairs = info.data_size.div_ceil(SECTOR_PAIR_BYTES as u64);
+    (pairs * SECTOR_PAIR_BYTES as u64).div_ceil(FRAME_DATA_BYTES as u64)
+}
+
 /// Compute the layout of every track inside the 2C_Audio file.
 pub fn track_layouts(infos: &[DsfInfo]) -> Vec<TrackLayout> {
     let mut layouts = Vec::with_capacity(infos.len());
     let mut next_sector = 0u32;
     for info in infos {
-        let frames = info.sacd_frames();
-        let sector_count = (frames as u32) * SECTORS_PER_FRAME;
+        let sector_count = (stream_frames(info) as u32) * SECTORS_PER_FRAME;
         layouts.push(TrackLayout {
             start_sector: next_sector,
             sector_count,
-            frames,
+            frames: info.sacd_frames(),
         });
         next_sector += sector_count;
     }
@@ -169,11 +177,19 @@ pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
     let mut packer = FramePacker::new(writer);
 
     let mut pair = [0u8; SECTOR_PAIR_BYTES];
+    let mut remaining = info.data_size;
     loop {
+        if remaining == 0 {
+            break;
+        }
+        let want = DSF_BLOCK_SIZE.min(remaining as usize);
         let mut l = [0u8; DSF_BLOCK_SIZE];
         let mut r = [0u8; DSF_BLOCK_SIZE];
-        let nl = read_padded(&mut reader, &mut l)?;
-        let nr = read_padded(&mut reader, &mut r)?;
+        let nl = read_padded(&mut reader, &mut l[..want])?;
+        remaining -= nl as u64;
+        let w2 = DSF_BLOCK_SIZE.min(remaining as usize);
+        let nr = read_padded(&mut reader, &mut r[..w2])?;
+        remaining -= nr as u64;
         if nl == 0 && nr == 0 {
             break;
         }
@@ -218,12 +234,12 @@ mod tests {
         let (_fa, a) = write_temp_dsf(2_822_400); // 1 s -> 75 frames
         let (_fb, b) = write_temp_dsf(2_822_400 * 2);
         let layouts = track_layouts(&[a.clone(), b.clone()]);
-        assert_eq!(layouts[0].frames, 75);
-        assert_eq!(layouts[0].sector_count, 75 * 5);
+        assert_eq!(layouts[0].frames, 75); // musical duration
+        assert_eq!(stream_frames(&a), 76); // emitted frames (padded)
+        assert_eq!(layouts[0].sector_count, 76 * 5);
         assert_eq!(layouts[0].start_sector, 0);
-        assert_eq!(layouts[1].start_sector, 75 * 5);
+        assert_eq!(layouts[1].start_sector, 76 * 5);
         assert_eq!(layouts[1].frames, 150);
-        assert_eq!(layouts[1].sector_count, 150 * 5);
     }
 
     #[test]
