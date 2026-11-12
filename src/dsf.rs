@@ -70,6 +70,18 @@ fn read_u64_le(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().expect("slice len checked"))
 }
 
+/// Locate the `fmt ` chunk: trust the header pointer if valid, otherwise
+/// scan the first bytes (some ripping tools write bogus header pointers).
+fn find_fmt(head: &[u8]) -> Option<usize> {
+    if head.len() >= 28 {
+        let p = read_u64_le(head, 0x0C) as usize;
+        if p + 4 <= head.len() && &head[p..p + 4] == b"fmt " {
+            return Some(p);
+        }
+    }
+    head.windows(4).position(|w| w == b"fmt ")
+}
+
 /// Parse DSF metadata from an in-memory buffer (used by tests and by `parse`).
 pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
     if data.len() < 28 {
@@ -84,14 +96,16 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
             path: path.to_path_buf(),
         });
     }
-    let fmt_offset = read_u64_le(data, 0x0C) as usize;
-    if fmt_offset + 0x34 > data.len() || &data[fmt_offset..fmt_offset + 4] != b"fmt " {
+    let f = find_fmt(data).ok_or_else(|| SacdError::MissingFmtChunk {
+        path: path.to_path_buf(),
+        offset: read_u64_le(data, 0x0C),
+    })?;
+    if f + 0x34 > data.len() {
         return Err(SacdError::MissingFmtChunk {
             path: path.to_path_buf(),
-            offset: fmt_offset as u64,
+            offset: f as u64,
         });
     }
-    let f = fmt_offset;
     let version = read_u32_le(data, f + 0x0C);
     if version != 1 {
         return Err(SacdError::UnsupportedVersion {
@@ -161,7 +175,16 @@ pub fn parse(path: &Path) -> Result<DsfInfo> {
             path: path.to_path_buf(),
         });
     }
-    let fmt_offset = read_u64_le(&header, 0x0C);
+    // Read the start of the file and locate `fmt ` (header pointer first,
+    // then scan: some tools write bogus pointers, e.g. total_size = 28).
+    let head_len = file_len.min(8192) as usize;
+    file.seek(SeekFrom::Start(0)).map_err(|e| io(path, e))?;
+    let mut head = vec![0u8; head_len];
+    file.read_exact(&mut head).map_err(|e| io(path, e))?;
+    let fmt_offset = find_fmt(&head).ok_or_else(|| SacdError::MissingFmtChunk {
+        path: path.to_path_buf(),
+        offset: read_u64_le(&header, 0x0C),
+    })? as u64;
     file.seek(SeekFrom::Start(fmt_offset))
         .map_err(|e| io(path, e))?;
     let mut fmt = vec![0u8; 0x34];
@@ -305,6 +328,20 @@ mod tests {
             parse_bytes(&data, path),
             Err(SacdError::UnsupportedChannels { channels: 1, .. })
         ));
+    }
+
+    #[test]
+    fn falls_back_to_scan_when_fmt_pointer_bogus() {
+        let path = Path::new("bogus.dsf");
+        let mut data = make_test_dsf(32768, false);
+        // Some ripping tools write total_size = 28 and a bogus fmt pointer;
+        // the real `fmt ` chunk still sits at offset 28.
+        data[4..12].copy_from_slice(&28u64.to_le_bytes());
+        data[12..20].copy_from_slice(&999_999u64.to_le_bytes());
+        let info = parse_bytes(&data, path).unwrap();
+        assert_eq!(info.sample_rate, 2_822_400);
+        assert_eq!(info.samples_per_channel, 32768);
+        assert_eq!(info.data_offset, 92);
     }
 
     #[test]
