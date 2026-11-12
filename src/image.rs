@@ -394,9 +394,9 @@ mod tests {
 
     #[test]
     fn image_has_sacd_signature_at_lba_510() {
-        let (_d, iso, summary) = build_test_image(32768); // 1 block pair = 4 sectors
-        assert_eq!(summary.audio_sectors, 4);
-        assert_eq!(summary.total_sectors, AUDIO_START_LBA + 4);
+        let (_d, iso, summary) = build_test_image(32768); // 1 frame = 5 sectors
+        assert_eq!(summary.audio_sectors, 5);
+        assert_eq!(summary.total_sectors, AUDIO_START_LBA + 5);
         assert_eq!(
             std::fs::metadata(iso.path()).unwrap().len(),
             summary.total_sectors as u64 * SECTOR as u64
@@ -443,6 +443,6 @@ mod tests {
         let audio = read_at(iso.path(), AUDIO_START_LBA, expected.len());
         assert_eq!(audio, expected);
         assert_eq!(summary.layouts[0].start_sector, 0);
-        assert_eq!(summary.layouts[0].sector_count, 4);
+        assert_eq!(summary.layouts[0].sector_count, 5);
     }
 }
