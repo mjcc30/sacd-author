@@ -30,3 +30,14 @@ cargo test          # unit + integration tests (real DSF fixtures included)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+## Test sample
+
+`samples/goldberg-var5-dsd64.dsf` is a CC0 (public domain) DSD64 file
+("Variatio 5", Open Goldberg Variations — Kimiko Ishizaka, via decaud.io),
+sha256 `bd3fbb4db97c7f8f7e9f4f780da34421c5ccaaf5a6a49182c62f4371db43234e`.
+Re-download it with `scripts/fetch_test_sample.sh`. Regenerate the demo image:
+
+```bash
+sacd-author samples/goldberg-var5-dsd64.dsf -o goldberg.iso
+```
