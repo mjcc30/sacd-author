@@ -88,7 +88,7 @@ pub const SACD_FRAME_RATE: u32 = 75;
 pub const VERSION_MAJOR: u8 = 1;
 pub const VERSION_MINOR: u8 = 0x14;
 pub const SAMPLE_FREQUENCY_DSD64: u8 = 0x04;
-pub const MAX_BYTE_RATE_DSD64_STEREO: u32 = 2_822_400 * 2 / 8; // 705600
+pub const MAX_BYTE_RATE_DSD64_STEREO: u32 = 337_920; // observed on commercial SACD area TOC
 pub const DISC_TYPE_HYBRID: u8 = 0x80;
 
 #[binrw]
@@ -419,7 +419,7 @@ mod tests {
         let bytes = build_area_toc(&layouts, 640);
         assert_eq!(bytes.len(), 40 * SECTOR_SIZE);
         assert_eq!(&bytes[0x000..0x008], b"TWOCHTOC");
-        assert_eq!(&bytes[0x010..0x014], &705600u32.to_be_bytes());
+        assert_eq!(&bytes[0x010..0x014], &337920u32.to_be_bytes());
         assert_eq!(bytes[0x014], 0x04);
         assert_eq!(bytes[0x020], 2); // channel_count
         assert_eq!(bytes[0x045], 2); // track_count

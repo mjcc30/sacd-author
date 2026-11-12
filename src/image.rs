@@ -54,7 +54,7 @@ pub const UDF_MASTER3_FE_LBA: u32 = 266;
 pub const UDF_AUDIO_FE_LBA: u32 = 267;
 pub const UDF_ROOT_FIDS_LBA: u32 = 268;
 pub const UDF_SACD_FIDS_LBA: u32 = 269;
-pub const AUDIO_START_LBA: u32 = 640;
+pub const AUDIO_START_LBA: u32 = 624;
 
 pub struct ImageSummary {
     pub total_sectors: u32,
