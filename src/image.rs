@@ -405,7 +405,7 @@ mod tests {
         let at_510 = read_at(iso.path(), 510, 8);
         assert_eq!(&at_510, b"SACDMTOC");
         let sector = read_at(iso.path(), 510, SECTOR);
-        assert_eq!(&sector[0x40..0x44], &540u32.to_be_bytes());
+        assert_eq!(&sector[0x40..0x44], &544u32.to_be_bytes());
     }
 
     #[test]
@@ -416,11 +416,11 @@ mod tests {
         assert_eq!(&pvd[1..6], b"CD001");
         let anchor = read_at(iso.path(), 256, 2);
         assert_eq!(&anchor, &2u16.to_le_bytes());
-        let area = read_at(iso.path(), 540, 8);
+        let area = read_at(iso.path(), 544, 8);
         assert_eq!(&area, b"TWOCHTOC");
-        let trl1 = read_at(iso.path(), 541, 8);
+        let trl1 = read_at(iso.path(), 545, 8);
         assert_eq!(&trl1, b"SACDTRL1");
-        let trl2 = read_at(iso.path(), 542, 8);
+        let trl2 = read_at(iso.path(), 546, 8);
         assert_eq!(&trl2, b"SACDTRL2");
         // UDF tag checksums valid on VDS sectors
         for lba in 256..=260 {

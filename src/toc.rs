@@ -81,9 +81,9 @@ pub const START_OF_MASTER_TOC: u32 = 510;
 pub const MASTER_TOC_LEN: u32 = 10;
 pub const MASTER_TOC_2_START: u32 = START_OF_MASTER_TOC + MASTER_TOC_LEN; // 520
 pub const MASTER_TOC_3_START: u32 = MASTER_TOC_2_START + MASTER_TOC_LEN; // 530
-pub const AREA_TOC_1_START: u32 = MASTER_TOC_3_START + MASTER_TOC_LEN; // 540
-pub const AREA_TOC_SECTORS: u16 = 3; // header + SACDTRL1 + SACDTRL2
-pub const AREA_TOC_2_START: u32 = AREA_TOC_1_START + AREA_TOC_SECTORS as u32; // 543
+pub const AREA_TOC_1_START: u32 = MASTER_TOC_3_START + MASTER_TOC_LEN + 4; // 544
+pub const AREA_TOC_SECTORS: u16 = 40; // header + SACDTRL1 + SACDTRL2 + text/ISRC/access areas
+pub const AREA_TOC_2_START: u32 = AREA_TOC_1_START + AREA_TOC_SECTORS as u32; // 584
 pub const SACD_FRAME_RATE: u32 = 75;
 pub const VERSION_MAJOR: u8 = 1;
 pub const VERSION_MINOR: u8 = 0x14;
@@ -356,6 +356,7 @@ pub fn build_area_toc(layouts: &[TrackLayout], audio_start_lba: u32) -> Vec<u8> 
     let mut out = to_sector_bytes(&header);
     out.extend_from_slice(&to_sector_bytes(&trl1));
     out.extend_from_slice(&to_sector_bytes(&trl2));
+    out.resize(AREA_TOC_SECTORS as usize * SECTOR_SIZE, 0);
     out
 }
 
@@ -385,10 +386,10 @@ mod tests {
         assert_eq!(&bytes[0x00..0x08], b"SACDMTOC");
         assert_eq!(bytes[0x08], 1);
         assert_eq!(bytes[0x09], 0x14);
-        assert_eq!(&bytes[0x40..0x44], &540u32.to_be_bytes());
-        assert_eq!(&bytes[0x44..0x48], &543u32.to_be_bytes());
+        assert_eq!(&bytes[0x40..0x44], &544u32.to_be_bytes());
+        assert_eq!(&bytes[0x44..0x48], &584u32.to_be_bytes());
         assert_eq!(bytes[0x50], DISC_TYPE_HYBRID);
-        assert_eq!(&bytes[0x54..0x56], &3u16.to_be_bytes());
+        assert_eq!(&bytes[0x54..0x56], &40u16.to_be_bytes());
         assert!(bytes[0xA8..].iter().all(|&b| b == 0));
     }
 
@@ -416,7 +417,7 @@ mod tests {
             },
         ];
         let bytes = build_area_toc(&layouts, 640);
-        assert_eq!(bytes.len(), 3 * SECTOR_SIZE);
+        assert_eq!(bytes.len(), 40 * SECTOR_SIZE);
         assert_eq!(&bytes[0x000..0x008], b"TWOCHTOC");
         assert_eq!(&bytes[0x010..0x014], &705600u32.to_be_bytes());
         assert_eq!(bytes[0x014], 0x04);
