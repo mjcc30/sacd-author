@@ -317,7 +317,14 @@ pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageS
     write_sector(&mut file, UDF_SACD_FIDS_LBA, &sacd_fids)?;
 
     // --- Scarlet Book TOCs (raw sectors) ---
-    let master_area = toc::master_toc_area();
+    let album_title = infos.first().and_then(|i| i.tags.album.clone());
+    let album_artist = infos.first().and_then(|i| i.tags.artist.clone());
+    let master_area = toc::master_toc_area_with_text(
+        album_title.as_deref(),
+        album_artist.as_deref(),
+        album_title.as_deref(),
+        album_artist.as_deref(),
+    );
     for base in [
         toc::START_OF_MASTER_TOC,
         toc::MASTER_TOC_2_START,
@@ -327,7 +334,19 @@ pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageS
             write_sector(&mut file, base + i as u32, chunk)?;
         }
     }
-    let area_toc = toc::build_area_toc(&layouts, AUDIO_START_LBA);
+    let texts: Vec<toc::TrackText> = infos
+        .iter()
+        .map(|info| toc::TrackText {
+            title: info.tags.title.clone().unwrap_or_else(|| {
+                info.path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }),
+            performer: info.tags.artist.clone().unwrap_or_default(),
+        })
+        .collect();
+    let area_toc = toc::build_area_toc(&layouts, AUDIO_START_LBA, &texts);
     for (i, chunk) in area_toc.chunks(SECTOR).enumerate() {
         write_sector(&mut file, toc::AREA_TOC_1_START + i as u32, chunk)?;
         write_sector(&mut file, toc::AREA_TOC_2_START + i as u32, chunk)?;

@@ -196,11 +196,54 @@ impl Default for MasterToc {
     }
 }
 
-/// One `SACDText` sector of the master TOC (all text positions = 0).
-pub fn master_sacd_text_sector() -> Vec<u8> {
+/// One `SACDText` sector of the master TOC. Layout: id[8], reserved[8],
+/// 16 x u16 BE text positions (album/disc title, artist, publisher,
+/// copyright + phonetics), then NUL-terminated strings in data[2000].
+/// A position of 0 means "absent".
+pub fn master_sacd_text_sector(
+    album_title: Option<&str>,
+    album_artist: Option<&str>,
+    disc_title: Option<&str>,
+    disc_artist: Option<&str>,
+) -> Vec<u8> {
     let mut s = vec![0u8; SECTOR_SIZE];
     s[0..8].copy_from_slice(b"SACDText");
+    let entries = [
+        album_title,
+        album_artist,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        disc_title,
+        disc_artist,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ];
+    let mut data_off = 48usize;
+    for (i, e) in entries.iter().enumerate() {
+        if let Some(txt) = e {
+            let bytes = ascii(txt).into_bytes();
+            let pos = data_off as u16;
+            s[16 + i * 2..18 + i * 2].copy_from_slice(&pos.to_be_bytes());
+            s[data_off..data_off + bytes.len()].copy_from_slice(&bytes);
+            data_off += bytes.len() + 1;
+        }
+    }
     s
+}
+
+/// Lossy ASCII for SACDText (character_set 1 = ISO 646).
+fn ascii(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
 }
 
 /// The `SACD_Man` (manufacturer info) sector of the master TOC.
@@ -214,12 +257,63 @@ pub fn master_man_sector() -> Vec<u8> {
 /// (one per locale) + SACD_Man. Readers such as foo_input_sacd require all
 /// three magics to be present.
 pub fn master_toc_area() -> Vec<u8> {
+    master_toc_area_with_text(None, None, None, None)
+}
+
+/// Full 10-sector master TOC area with optional disc-level text.
+pub fn master_toc_area_with_text(
+    album_title: Option<&str>,
+    album_artist: Option<&str>,
+    disc_title: Option<&str>,
+    disc_artist: Option<&str>,
+) -> Vec<u8> {
     let mut out = MasterToc::new().to_sector();
     for _ in 0..8 {
-        out.extend_from_slice(&master_sacd_text_sector());
+        out.extend_from_slice(&master_sacd_text_sector(
+            album_title,
+            album_artist,
+            disc_title,
+            disc_artist,
+        ));
     }
     out.extend_from_slice(&master_man_sector());
     out
+}
+
+/// One track text entry: (type, string).
+pub struct TrackText {
+    pub title: String,
+    pub performer: String,
+}
+
+/// The `SACDTTxt` sector of an area TOC: id[8], track_text_position[255]
+/// (u16 BE offsets into this sector), then per-track text blocks.
+/// Each block: amount u8, reserved[3], then amount entries of
+/// [type u8, 0x20 u8, NUL-terminated string].
+pub fn area_text_sector(tracks: &[TrackText]) -> Vec<u8> {
+    let mut s = vec![0u8; SECTOR_SIZE];
+    s[0..8].copy_from_slice(b"SACDTTxt");
+    let mut off = 8 + 255 * 2;
+    for (i, t) in tracks.iter().enumerate() {
+        if off >= SECTOR_SIZE {
+            break;
+        }
+        s[8 + i * 2..10 + i * 2].copy_from_slice(&(off as u16).to_be_bytes());
+        let entries: [(u8, &str); 2] = [(0x01, t.title.as_str()), (0x02, t.performer.as_str())];
+        s[off] = entries.len() as u8;
+        off += 4;
+        for (ttype, txt) in entries {
+            let bytes = ascii(txt).into_bytes();
+            if off + 2 + bytes.len() + 1 > SECTOR_SIZE {
+                break;
+            }
+            s[off] = ttype;
+            s[off + 1] = 0x20;
+            s[off + 2..off + 2 + bytes.len()].copy_from_slice(&bytes);
+            off += 2 + bytes.len() + 1;
+        }
+    }
+    s
 }
 
 #[binrw]
@@ -309,9 +403,14 @@ pub struct TrackList2 {
     pub duration: [TrackTime; 255],
 }
 
-/// Build the 3-sector stereo area TOC for the given tracks.
+/// Build the stereo area TOC (AREA_TOC_SECTORS sectors) for the given tracks.
 /// `audio_start_lba` is the absolute LBA where the 2C_Audio file starts on disc.
-pub fn build_area_toc(layouts: &[TrackLayout], audio_start_lba: u32) -> Vec<u8> {
+/// `texts` (optional) are written into a SACDTTxt sector at index 3.
+pub fn build_area_toc(
+    layouts: &[TrackLayout],
+    audio_start_lba: u32,
+    texts: &[TrackText],
+) -> Vec<u8> {
     let track_count = layouts.len() as u8;
     let total_frames: u64 = layouts.iter().map(|l| l.frames).sum();
     let first_start = layouts
@@ -368,7 +467,7 @@ pub fn build_area_toc(layouts: &[TrackLayout], audio_start_lba: u32) -> Vec<u8> 
         text_area_count: 0,
         reserved09: [0; 7],
         languages: [LocaleTable::default(); 10],
-        track_text_offset: 0,
+        track_text_offset: if texts.is_empty() { 0 } else { 3 },
         index_list_offset: 0,
         access_list_offset: 0,
         reserved10: [0; 10],
@@ -382,6 +481,9 @@ pub fn build_area_toc(layouts: &[TrackLayout], audio_start_lba: u32) -> Vec<u8> 
     let mut out = to_sector_bytes(&header);
     out.extend_from_slice(&to_sector_bytes(&trl1));
     out.extend_from_slice(&to_sector_bytes(&trl2));
+    if !texts.is_empty() {
+        out.extend_from_slice(&area_text_sector(texts));
+    }
     out.resize(AREA_TOC_SECTORS as usize * SECTOR_SIZE, 0);
     out
 }
@@ -442,7 +544,7 @@ mod tests {
                 frames: 150,
             },
         ];
-        let bytes = build_area_toc(&layouts, 640);
+        let bytes = build_area_toc(&layouts, 640, &[]);
         assert_eq!(bytes.len(), 40 * SECTOR_SIZE);
         assert_eq!(&bytes[0x000..0x008], b"TWOCHTOC");
         assert_eq!(&bytes[0x010..0x014], &337920u32.to_be_bytes());
@@ -490,5 +592,35 @@ mod tests {
             assert_eq!(&area[i * SECTOR_SIZE..i * SECTOR_SIZE + 8], b"SACDText");
         }
         assert_eq!(&area[9 * SECTOR_SIZE..9 * SECTOR_SIZE + 8], b"SACD_Man");
+    }
+
+    #[test]
+    fn sacd_text_sectors_carry_titles() {
+        let m = master_sacd_text_sector(Some("My Album"), Some("An Artist"), None, None);
+        assert_eq!(&m[0..8], b"SACDText");
+        let title_pos = u16::from_be_bytes([m[16], m[17]]) as usize;
+        let artist_pos = u16::from_be_bytes([m[18], m[19]]) as usize;
+        assert_eq!(&m[title_pos..title_pos + 8], b"My Album");
+        assert_eq!(&m[artist_pos..artist_pos + 9], b"An Artist");
+
+        let texts = vec![
+            TrackText {
+                title: "Song A".into(),
+                performer: "Band".into(),
+            },
+            TrackText {
+                title: "Song B".into(),
+                performer: "Band".into(),
+            },
+        ];
+        let a = area_text_sector(&texts);
+        assert_eq!(&a[0..8], b"SACDTTxt");
+        let p0 = u16::from_be_bytes([a[8], a[9]]) as usize;
+        let p1 = u16::from_be_bytes([a[10], a[11]]) as usize;
+        assert_eq!(a[p0], 2); // amount
+        assert_eq!(a[p0 + 4], 0x01); // title type
+        assert_eq!(&a[p0 + 6..p0 + 11], b"Song ");
+        assert!(p1 > p0);
+        assert_eq!(a[p1 + 4], 0x01);
     }
 }
