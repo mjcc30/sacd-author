@@ -18,6 +18,10 @@
 //! One audio frame (1/75 s) = 37632 samples/channel = 4704 bytes/channel =
 //! 9408 bytes of interleaved stereo = 5 sectors of 2048 bytes
 //! (2042 + 3*2045 + 1231 payload bytes).
+//!
+//! Note: SACD stores DSD bytes bit-reversed compared to DSF (see
+//! sacd-ripper's bit_reverse_table in dsf.c), so every payload byte is
+//! bit-reversed during conversion.
 
 use crate::dsf::DsfInfo;
 use std::fs::File;
@@ -174,8 +178,8 @@ pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
             break;
         }
         for i in 0..DSF_BLOCK_SIZE {
-            pair[2 * i] = l[i];
-            pair[2 * i + 1] = r[i];
+            pair[2 * i] = l[i].reverse_bits();
+            pair[2 * i + 1] = r[i].reverse_bits();
         }
         packer.push(&pair)?;
     }

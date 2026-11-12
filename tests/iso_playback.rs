@@ -123,10 +123,10 @@ fn iso_plays_back_like_a_sacd_reader() {
     }
     assert_eq!(frames, 1);
     assert_eq!(payload.len(), sacd::FRAME_DATA_BYTES);
-    // fixture data chunk (1 block pair = 8192 bytes) is 0xAB; the frame is
+    // fixture data chunk (1 block pair = 8192 bytes) is 0xAB, stored bit-reversed as 0xD5; the frame is
     // then zero-padded up to FRAME_DATA_BYTES
     assert!(
-        payload[..8192].iter().all(|&b| b == 0xAB),
+        payload[..8192].iter().all(|&b| b == 0xD5), // 0xAB bit-reversed
         "payload mismatch head={:02x?} tail={:02x?}",
         &payload[..8],
         &payload[8184..8192]
