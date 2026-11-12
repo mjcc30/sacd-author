@@ -2,7 +2,7 @@
 //! ("02 - Van Halen - Eruption.dsf", DSD64 stereo): DSD header + fmt chunk
 //! + data chunk header.
 
-use sacd_author::dsf;
+use sacd_author::{dsf, id3};
 use std::path::Path;
 
 #[test]
@@ -17,4 +17,15 @@ fn parses_real_eruption_header() {
     assert_eq!(info.data_size, 72_146_956);
     assert!((info.duration_secs() - 102.24).abs() < 0.01);
     assert_eq!(info.sacd_frames(), 7668);
+}
+
+#[test]
+fn parses_real_eruption_id3v23_utf16() {
+    let bytes = include_bytes!("fixtures/eruption_id3.bin");
+    let tags = id3::parse_id3_tail(bytes, Path::new("eruption.dsf"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(tags.title.as_deref(), Some("Eruption"));
+    assert_eq!(tags.artist.as_deref(), Some("Van Halen"));
+    assert_eq!(tags.album.as_deref(), Some("Van Halen"));
 }
