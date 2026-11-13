@@ -34,8 +34,11 @@ pub const BLOCK_SIZE: u32 = 4096;
 /// How the raw DSD stream is packed inside the input file's data area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioPacking {
-    /// DSF/DFF: interleaved 4096-byte blocks per channel ([L blk][R blk]...).
+    /// DSF: interleaved 4096-byte blocks per channel ([L blk][R blk]...).
     Blocks,
+    /// DFF (DSDIFF 1.5, "clustered frames"): channel bytes interleaved
+    /// sample-wise (ch0[0], ch1[0], ..., ch0[1], ...), no 4096-byte blocks.
+    Interleaved,
     /// DoP (WAV-DSD): 24-bit PCM frames, 3 bytes per channel per sample
     /// ([dsd_lo, dsd_hi, marker]), channels interleaved per frame.
     Dop,
@@ -49,13 +52,13 @@ pub struct DsfInfo {
     pub samples_per_channel: u64,
     pub block_size: u32,
     pub data_offset: u64,
-    /// For `AudioPacking::Blocks`: bytes of the data chunk.
+    /// For `AudioPacking::Blocks`/`Interleaved`: bytes of the data chunk.
     /// For `AudioPacking::Dop`: virtual size of the unpacked stream, rounded
     /// up to whole 8192-byte block pairs (what `sacd::stream_frames` needs).
     pub data_size: u64,
     pub tags: Id3Tags,
-    /// DSF and DoP store DSD bytes bit-reversed vs the SACD native order; DFF
-    /// does not. The SACD converter bit-reverses only when this is true.
+    /// DSF and DoP store DSD bytes bit-reversed vs the SACD/DFF native order;
+    /// DFF does not. The SACD converter bit-reverses only when this is true.
     pub bit_reverse_needed: bool,
     pub packing: AudioPacking,
 }

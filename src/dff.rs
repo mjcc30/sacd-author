@@ -4,9 +4,10 @@
 //! (see sacd-ripper's bit_reverse_table in dsf.c).
 //!
 //! Layout: "FRM8" + u64 BE size + "DSD " form, then chunks (id[4] + u64 BE
-//! size + data, padded to even): "FVER", "PROP" ("SND" + "FS  "/"CHNL"/
-//! "CMPR"/"LSCO"), "DSD " (audio blocks, 4096 bytes per channel interleaved
-//! block by block, same as DSF), optional "ID3 " chunk with an ID3v2 tag.
+//! size + data, padded to even): "FVER", "PROP" ("SND " + "FS  "/"CHNL"/
+//! "CMPR"/"LSCO"), "DSD " (audio: channel bytes interleaved sample-wise
+//! = "clustered frames" of numChannels bytes, per DSDIFF 1.5 spec 3.3,
+//! native SACD bit order), optional "ID3 " chunk with an ID3v2 tag.
 
 use crate::dsf::DsfInfo;
 use crate::error::{Result, SacdError};
@@ -109,7 +110,7 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
         data_size,
         tags,
         bit_reverse_needed: false,
-        packing: crate::dsf::AudioPacking::Blocks,
+        packing: crate::dsf::AudioPacking::Interleaved,
     })
 }
 
@@ -173,12 +174,13 @@ mod tests {
     #[test]
     fn accepts_multichannel_and_rejects_bad_counts() {
         let path = Path::new("mc.dff");
-        // 4 channels, one 4096-byte block per channel
+        // 4 channels, byte-interleaved clustered frames (DSDIFF 1.5)
         let audio = vec![0x11; 4 * 4096];
         let d = crate::testutil::make_test_dff(&audio, 4, None);
         let info = parse_bytes(&d, path).unwrap();
         assert_eq!(info.channels, 4);
         assert_eq!(info.samples_per_channel, 4096 * 8);
+        assert_eq!(info.packing, crate::dsf::AudioPacking::Interleaved);
         let d7 = crate::testutil::make_test_dff(&vec![0; 7 * 4096], 7, None);
         assert!(matches!(
             parse_bytes(&d7, path),

@@ -134,11 +134,11 @@ pub fn make_test_dop(interleaved: &[u8], title: Option<&str>) -> Vec<u8> {
     out
 }
 
-/// Build a minimal DFF with the given audio bytes (channel blocks of 4096
-/// bytes each, interleaved block by block, native SACD bit order), the given
-/// channel count (2..=6) and an optional ID3v2.4 title.
+/// Build a minimal DFF with the given audio bytes in DSDIFF "clustered
+/// frame" layout (channel bytes interleaved sample-wise, native SACD bit
+/// order), the given channel count (2..=6) and an optional ID3v2.4 title.
 pub fn make_test_dff(audio: &[u8], channels: u16, title: Option<&str>) -> Vec<u8> {
-    assert!(audio.len().is_multiple_of(4096 * channels as usize));
+    assert!(audio.len().is_multiple_of(channels as usize));
     fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
         let mut c = id.to_vec();
         c.extend_from_slice(&(body.len() as u64).to_be_bytes());

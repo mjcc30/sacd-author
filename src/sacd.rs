@@ -84,11 +84,11 @@ pub fn frame_timecode(idx: u64) -> (u8, u8, u8) {
 
 /// Pack one full audio frame (FRAME_DATA_BYTES bytes) into SECTORS_PER_FRAME
 /// 2048-byte sectors and write them to `out`.
-fn emit_frame(out: &mut impl Write, idx: u64, data: &[u8]) -> std::io::Result<()> {
-    debug_assert_eq!(data.len(), FRAME_DATA_BYTES);
+fn emit_frame(out: &mut impl Write, idx: u64, data: &[u8]) -> std::io::Result<u32> {
     let (m, s, f) = frame_timecode(idx);
     let mut pos = 0usize;
     let mut first = true;
+    let mut sectors = 0u32;
     while pos < data.len() {
         let mut sector = [0u8; SECTOR_SIZE];
         let frame_info_count: u8 = if first { 1 } else { 0 };
@@ -107,23 +107,27 @@ fn emit_frame(out: &mut impl Write, idx: u64, data: &[u8]) -> std::io::Result<()
         out.write_all(&sector)?;
         pos += len;
         first = false;
+        sectors += 1;
     }
-    Ok(())
+    Ok(sectors)
 }
 
-/// Accumulates the interleaved DSD stream and emits packed frames.
+/// Accumulates the interleaved DSD stream and emits packed frames of
+/// `frame_len` bytes each (channels * 4704).
 struct FramePacker<W: Write> {
     out: W,
     buf: Vec<u8>,
+    frame_len: usize,
     frame_idx: u64,
     sectors: u32,
 }
 
 impl<W: Write> FramePacker<W> {
-    fn new(out: W) -> Self {
+    fn new(out: W, frame_len: usize) -> Self {
         Self {
             out,
-            buf: Vec::with_capacity(FRAME_DATA_BYTES),
+            buf: Vec::with_capacity(frame_len),
+            frame_len,
             frame_idx: 0,
             sectors: 0,
         }
@@ -131,21 +135,21 @@ impl<W: Write> FramePacker<W> {
 
     fn push(&mut self, data: &[u8]) -> std::io::Result<()> {
         self.buf.extend_from_slice(data);
-        while self.buf.len() >= FRAME_DATA_BYTES {
-            let frame: Vec<u8> = self.buf.drain(..FRAME_DATA_BYTES).collect();
-            emit_frame(&mut self.out, self.frame_idx, &frame)?;
+        while self.buf.len() >= self.frame_len {
+            let frame: Vec<u8> = self.buf.drain(..self.frame_len).collect();
+            let n = emit_frame(&mut self.out, self.frame_idx, &frame)?;
             self.frame_idx += 1;
-            self.sectors += SECTORS_PER_FRAME;
+            self.sectors += n;
         }
         Ok(())
     }
 
     fn finish(mut self) -> std::io::Result<u32> {
         if !self.buf.is_empty() {
-            self.buf.resize(FRAME_DATA_BYTES, 0); // pad last frame with zeros
-            emit_frame(&mut self.out, self.frame_idx, &self.buf)?;
+            self.buf.resize(self.frame_len, 0); // pad last frame with zeros
+            let n = emit_frame(&mut self.out, self.frame_idx, &self.buf)?;
             self.frame_idx += 1;
-            self.sectors += SECTORS_PER_FRAME;
+            self.sectors += n;
         }
         Ok(self.sectors)
     }
@@ -178,7 +182,7 @@ fn convert_track_dop(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
     file.seek(SeekFrom::Start(info.data_offset))?;
     let mut reader = BufReader::with_capacity(DOP_GROUP_BYTES, &mut file);
     let writer = BufWriter::with_capacity(SECTORS_PER_FRAME as usize * SECTOR_SIZE, out);
-    let mut packer = FramePacker::new(writer);
+    let mut packer = FramePacker::new(writer, FRAME_DATA_BYTES);
 
     let mut pair = [0u8; SECTOR_PAIR_BYTES];
     let rev = info.bit_reverse_needed;
@@ -207,12 +211,51 @@ fn convert_track_dop(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
     packer.finish()
 }
 
+/// Bytes per channel in one SACD audio frame (1/75 s) at DSD64:
+/// 2822400 / 75 = 37632 bits = 4704 bytes (Scarlet Book FRAME_SIZE_64).
+pub const FRAME_SIZE_64: usize = 4704;
+
+/// Payload bytes of one audio frame for `channels` channels.
+pub fn frame_data_bytes(channels: usize) -> usize {
+    channels * FRAME_SIZE_64
+}
+
+/// Pack an already sample-interleaved, native-bit-order DSD stream (e.g. the
+/// payload of a multichannel area, or a DFF data chunk) into SACD sectors.
+/// Returns the number of 2048-byte sectors written.
+pub fn pack_interleaved_stream(
+    data: &[u8],
+    channels: usize,
+    out: &mut impl Write,
+) -> std::io::Result<u32> {
+    let frame_len = frame_data_bytes(channels);
+    let mut packer = FramePacker::new(out, frame_len);
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let n = frame_len.min(data.len() - pos);
+        packer.push(&data[pos..pos + n])?;
+        pos += n;
+    }
+    packer.finish()
+}
+
 /// Convert one input track (DSF/DFF `data` chunk, or DoP WAV payload) into
-/// packed SACD sectors appended to `out`.
+/// packed SACD 2C (stereo) sectors appended to `out`.
 /// Returns the number of 2048-byte sectors written.
 pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u32> {
     if info.packing == AudioPacking::Dop {
         return convert_track_dop(info, out);
+    }
+    if info.channels != 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{}: SACD-R authoring supports the stereo 2C area only (got {} channels); \
+                 multichannel SACD requires DST compression",
+                info.path.display(),
+                info.channels
+            ),
+        ));
     }
     let path = info.path.clone();
     let mut file = File::open(&path)
@@ -220,31 +263,52 @@ pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
     file.seek(SeekFrom::Start(info.data_offset))?;
     let mut reader = BufReader::with_capacity(SECTOR_PAIR_BYTES, &mut file);
     let writer = BufWriter::with_capacity(SECTORS_PER_FRAME as usize * SECTOR_SIZE, out);
-    let mut packer = FramePacker::new(writer);
+    let mut packer = FramePacker::new(writer, FRAME_DATA_BYTES);
 
     let mut pair = [0u8; SECTOR_PAIR_BYTES];
-    let mut remaining = info.data_size;
-    loop {
-        if remaining == 0 {
-            break;
+    let rev = info.bit_reverse_needed;
+    if info.packing == AudioPacking::Interleaved {
+        // DFF: channel bytes already interleaved sample-wise; read whole
+        // 8192-byte groups (4096 samples x 2 ch) at once
+        let mut remaining = info.data_size;
+        while remaining > 0 {
+            let want = SECTOR_PAIR_BYTES.min(remaining as usize);
+            let n = read_padded(&mut reader, &mut pair[..want])?;
+            remaining -= n as u64;
+            if n == 0 {
+                break;
+            }
+            for b in pair.iter_mut() {
+                if rev {
+                    *b = b.reverse_bits();
+                }
+            }
+            packer.push(&pair)?;
         }
-        let want = DSF_BLOCK_SIZE.min(remaining as usize);
-        let mut l = [0u8; DSF_BLOCK_SIZE];
-        let mut r = [0u8; DSF_BLOCK_SIZE];
-        let nl = read_padded(&mut reader, &mut l[..want])?;
-        remaining -= nl as u64;
-        let w2 = DSF_BLOCK_SIZE.min(remaining as usize);
-        let nr = read_padded(&mut reader, &mut r[..w2])?;
-        remaining -= nr as u64;
-        if nl == 0 && nr == 0 {
-            break;
+    } else {
+        // DSF: [L blk 4096][R blk 4096] block pairs
+        let mut remaining = info.data_size;
+        loop {
+            if remaining == 0 {
+                break;
+            }
+            let want = DSF_BLOCK_SIZE.min(remaining as usize);
+            let mut l = [0u8; DSF_BLOCK_SIZE];
+            let mut r = [0u8; DSF_BLOCK_SIZE];
+            let nl = read_padded(&mut reader, &mut l[..want])?;
+            remaining -= nl as u64;
+            let w2 = DSF_BLOCK_SIZE.min(remaining as usize);
+            let nr = read_padded(&mut reader, &mut r[..w2])?;
+            remaining -= nr as u64;
+            if nl == 0 && nr == 0 {
+                break;
+            }
+            for i in 0..DSF_BLOCK_SIZE {
+                pair[2 * i] = if rev { l[i].reverse_bits() } else { l[i] };
+                pair[2 * i + 1] = if rev { r[i].reverse_bits() } else { r[i] };
+            }
+            packer.push(&pair)?;
         }
-        let rev = info.bit_reverse_needed;
-        for i in 0..DSF_BLOCK_SIZE {
-            pair[2 * i] = if rev { l[i].reverse_bits() } else { l[i] };
-            pair[2 * i + 1] = if rev { r[i].reverse_bits() } else { r[i] };
-        }
-        packer.push(&pair)?;
     }
     let sectors = packer.finish()?;
     Ok(sectors)

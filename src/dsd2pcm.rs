@@ -124,6 +124,7 @@ struct DsdBlockReader {
     file: File,
     remaining_raw: u64,
     dop: bool,
+    interleaved: bool,
     channels: usize,
     eof: bool,
 }
@@ -148,6 +149,7 @@ impl DsdBlockReader {
             file,
             remaining_raw,
             dop: info.packing == AudioPacking::Dop,
+            interleaved: info.packing == AudioPacking::Interleaved,
             channels,
             eof: false,
         })
@@ -192,8 +194,16 @@ impl DsdBlockReader {
                 block[4 * s + 2] = b[1];
                 block[4 * s + 3] = b[4];
             }
+        } else if self.interleaved {
+            // DFF layout: channel bytes already interleaved sample-wise
+            let want = block.len().min(self.remaining_raw as usize);
+            let n = self.read_padded(&mut block[..want])?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
         } else {
-            // DSF/DFF layout: C channel blocks of 4096 bytes, block by block
+            // DSF layout: C channel blocks of 4096 bytes, block by block
             let mut chan_blocks = vec![vec![0u8; 4096]; c];
             let mut any = 0usize;
             for cb in chan_blocks.iter_mut() {
@@ -687,8 +697,9 @@ mod tests {
         dop_file.write_all(&dop_bytes).unwrap();
         let dop_info = crate::dop::parse_bytes(&dop_bytes, dop_file.path()).unwrap();
 
-        // equivalent DFF: same stream in native (bit-reversed) order
-        let native: Vec<u8> = data.iter().map(|b| b.reverse_bits()).collect();
+        // equivalent DFF: same stream, DSF layout -> DFF layout (bit-reverse
+        // + byte-interleave across channels)
+        let native = crate::dsf_write::dsf_layout_to_dff(&data, 2);
         let dff_bytes = make_test_dff(&native, 2, None);
         let mut dff_file = tempfile::NamedTempFile::new().unwrap();
         dff_file.write_all(&dff_bytes).unwrap();

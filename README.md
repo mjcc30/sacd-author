@@ -9,12 +9,18 @@ Input audio is **native DSD64 only**, in any of these containers (chosen by
 file extension):
 
 - `.dsf` — Sony DSF (bit-reversed DSD bytes, ID3v2 tags at the end)
-- `.dff` — Philips DSDIFF (native SACD bit order, optional `ID3 ` chunk)
+- `.dff` — Philips DSDIFF 1.5: DSD chunk holds "clustered frames" (channel
+  bytes interleaved sample-wise, native SACD/MSB-first bit order), 2–6
+  channels; optional `ID3 ` chunk
 - `.wav` — **WAV-DSD / DoP** (DSD over PCM, DoP Open Standard v1.1: 24-bit
   IEEE-float carrier at 176.4 kHz, marker bytes 0x05/0xFA; RIFF `LIST/INFO`
   INAM/IART/IPRD and `id3 ` chunks are read as tags)
 
-`extract` writes DSF by default, DFF with `-f dff`.
+`extract` writes DSF by default, DFF with `-f dff`. With `--mch` it reads
+the **multichannel area** (MULCHTOC/MC_Audio, master TOC area_2) and writes
+one multichannel DFF per track (DFF output only; DST-compressed areas are
+rejected — commercial SACD MC areas are DST, use `sacd-ripper --mch` for
+those).
 Plain PCM formats (FLAC, PCM WAV, WavPack, ...) are intentionally not
 supported: a SACD-R needs 1-bit DSD, and PCM->DSD requires a lossy
 sigma-delta modulation that is out of scope. Convert PCM to DSF first with
@@ -28,8 +34,9 @@ sacd-author track01.dsf track02.dff track03.wav ... -o album.iso
 sacd-author convert track01.dsf track02.dsf -o album.iso
 
 # SACD-R ISO -> DSF or DFF tracks (for non-SACD players / archiving)
-sacd-author extract album.iso -o extracted/              # DSF (default)
+sacd-author extract album.iso -o extracted/              # DSF (default, stereo 2C area)
 sacd-author extract album.iso -o extracted_dff/ -f dff    # DFF
+sacd-author extract album.iso -o extracted_mc/ --mch -f dff   # multichannel area -> multichannel DFF
 
 # Plain data ISO from any files (FLAC/WAV/...): burn to DVD-R, readable by
 # any modern player (Sony BDP-S490 plays FLAC 24/96 from disc) — ISO 9660

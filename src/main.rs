@@ -40,6 +40,11 @@ enum Commands {
         /// Output format: dsf (default) or dff
         #[arg(short = 'f', long, default_value = "dsf")]
         format: String,
+        /// Read the multichannel area (MULCHTOC/MC_Audio) instead of the
+        /// stereo 2C area; output is always DFF (DSF writer is stereo-only).
+        /// DST-compressed areas are not supported.
+        #[arg(long)]
+        mch: bool,
     },
     /// Build a plain ISO 9660 + Joliet data image from files (FLAC/WAV/...),
     /// readable by any modern player from DVD-R (e.g. Sony BDP-S490 plays FLAC)
@@ -96,6 +101,14 @@ fn convert(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
     for input in inputs {
         let info =
             parse_input(input).with_context(|| format!("failed to parse {}", input.display()))?;
+        if info.channels != 2 {
+            anyhow::bail!(
+                "{}: SACD-R authoring supports the stereo 2C area only ({} channels given); \
+                 multichannel SACD areas are DST-compressed, which we don't encode",
+                input.display(),
+                info.channels
+            );
+        }
         println!(
             "{}: {} Hz, {} ch, {} samples, {:.2}s, {} SACD frames",
             input.display(),
@@ -137,14 +150,25 @@ fn convert(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn extract(iso: &std::path::Path, output: &std::path::Path, format: &str) -> Result<()> {
-    let img =
-        iso_read::read_iso(iso).with_context(|| format!("failed to read {}", iso.display()))?;
+fn extract(iso: &std::path::Path, output: &std::path::Path, format: &str, mch: bool) -> Result<()> {
+    let area = if mch {
+        iso_read::Area::MultiChannel
+    } else {
+        iso_read::Area::TwoChannel
+    };
+    let img = iso_read::read_iso_area(iso, area)
+        .with_context(|| format!("failed to read {}", iso.display()))?;
+    if mch && format != "dff" {
+        anyhow::bail!(
+            "--mch extracts the multichannel area as DFF (use -f dff); DSF output is stereo-only"
+        );
+    }
     std::fs::create_dir_all(output)?;
     println!(
-        "{}: {} track(s){}",
+        "{}: {} track(s), {} channel(s){}",
         iso.display(),
         img.tracks.len(),
+        img.channels,
         img.album_title
             .as_ref()
             .map(|t| format!(", album \"{t}\""))
@@ -167,12 +191,20 @@ fn extract(iso: &std::path::Path, output: &std::path::Path, format: &str) -> Res
             .collect();
         let ext = if format == "dff" { "dff" } else { "dsf" };
         let path = output.join(format!("{:02} {safe}.{ext}", i + 1));
-        let samples = track.data.len() as u64 / 2 * 8;
-        match ext {
-            "dff" => dsf_write::write_dff(
+        let samples = track.data.len() as u64 / track.channels as u64 * 8;
+        match (ext, track.layout) {
+            ("dff", iso_read::DataLayout::Dsf) => dsf_write::write_dff(
                 &path,
-                &track.data,
-                samples,
+                &dsf_write::dsf_layout_to_dff(&track.data, track.channels as usize),
+                track.channels,
+                track.title.as_deref(),
+                track.performer.as_deref(),
+                img.album_title.as_deref(),
+            )?,
+            ("dff", iso_read::DataLayout::McRaw) => dsf_write::write_dff(
+                &path,
+                &track.data, // already DFF layout (interleaved, native bit order)
+                track.channels,
                 track.title.as_deref(),
                 track.performer.as_deref(),
                 img.album_title.as_deref(),
@@ -311,7 +343,8 @@ fn main() -> Result<()> {
             iso,
             output,
             format,
-        }) => extract(&iso, &output, &format),
+            mch,
+        }) => extract(&iso, &output, &format, mch),
         Some(Commands::DataIso { inputs, output }) => data_iso_cmd(&inputs, &output),
         Some(Commands::Dsd2Pcm {
             input,

@@ -102,18 +102,39 @@ fn be_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
     c
 }
 
-/// Write a stereo DSD64 DFF (DSDIFF) file from DSF-layout audio data.
+/// Convert DSF-layout audio ([ch0 blk 4096][ch1 blk 4096]..., LSB-first bit
+/// order) to DFF layout: channel bytes interleaved sample-wise ("clustered
+/// frames", DSDIFF 1.5 §3.3), native MSB-first bit order.
+pub fn dsf_layout_to_dff(data: &[u8], channels: usize) -> Vec<u8> {
+    let block = BLOCK_SIZE as usize;
+    assert!(data.len().is_multiple_of(block * channels));
+    let mut out = Vec::with_capacity(data.len());
+    let nblocks = data.len() / (block * channels);
+    for b in 0..nblocks {
+        for i in 0..block {
+            for ch in 0..channels {
+                out.push(data[(b * channels + ch) * block + i].reverse_bits());
+            }
+        }
+    }
+    out
+}
+
+/// Write a DSD64 DFF (DSDIFF) file with `channels` channels. `data` is the
+/// DSD chunk payload in DFF layout: channel bytes interleaved sample-wise,
+/// native bit order (e.g. produced by `dsf_layout_to_dff`, or the raw
+/// payload of a multichannel SACD area).
 pub fn write_dff(
     path: &Path,
     data: &[u8],
-    _samples_per_channel: u64, // DFF has no sample-count field; derived from data size
+    channels: u32,
     title: Option<&str>,
     artist: Option<&str>,
     album: Option<&str>,
 ) -> std::io::Result<()> {
     let mut prop = b"SND ".to_vec();
     prop.extend_from_slice(&be_chunk(b"FS  ", &DSD64_SAMPLE_RATE.to_be_bytes()));
-    prop.extend_from_slice(&be_chunk(b"CHNL", &2u16.to_be_bytes()));
+    prop.extend_from_slice(&be_chunk(b"CHNL", &(channels as u16).to_be_bytes()));
     let mut cmpr = b"DSD ".to_vec();
     cmpr.push(0);
     prop.extend_from_slice(&be_chunk(b"CMPR", &cmpr));
@@ -142,18 +163,43 @@ mod tests {
 
     #[test]
     fn written_dff_parses_back() {
-        let data = vec![0xABu8; 8192];
+        // DFF layout: stereo clustered frames (L R L R ...), native order
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
         let f = tempfile::NamedTempFile::new().unwrap();
-        write_dff(f.path(), &data, 32768, Some("T"), Some("A"), Some("AL")).unwrap();
+        write_dff(f.path(), &data, 2, Some("T"), Some("A"), Some("AL")).unwrap();
         let bytes = std::fs::read(f.path()).unwrap();
         let info = crate::dff::parse_bytes(&bytes, f.path()).unwrap();
         assert_eq!(info.samples_per_channel, 32768);
         assert_eq!(info.data_size, 8192);
+        assert_eq!(info.channels, 2);
         assert_eq!(
             &bytes[info.data_offset as usize..info.data_offset as usize + 8192],
             &data[..]
         );
         assert_eq!(info.tags.title.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn dsf_layout_to_dff_interleaves_and_reverses() {
+        // 1 block pair: L block = 0x01..., R block = 0x80...
+        let mut dsf = vec![0x01u8; 4096];
+        dsf.extend_from_slice(&[0x80u8; 4096]);
+        let dff = dsf_layout_to_dff(&dsf, 2);
+        assert_eq!(dff.len(), 8192);
+        assert_eq!(dff[0], 0x01u8.reverse_bits());
+        assert_eq!(dff[1], 0x80u8.reverse_bits());
+        // and a 4-channel case round-trips through the DFF parser
+        let mc: Vec<u8> = (0..4 * 4096u32).map(|i| (i % 253) as u8).collect();
+        // build DSF-layout 4ch: [c0 blk][c1 blk][c2 blk][c3 blk]
+        let mut dsf4 = vec![0u8; 4 * 4096];
+        for i in 0..4096 {
+            for ch in 0..4 {
+                dsf4[ch * 4096 + i] = mc[i * 4 + ch];
+            }
+        }
+        let dff4 = dsf_layout_to_dff(&dsf4, 4);
+        let rev: Vec<u8> = dff4.iter().map(|b| b.reverse_bits()).collect();
+        assert_eq!(rev, mc);
     }
 
     #[test]
