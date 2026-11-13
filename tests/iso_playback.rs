@@ -52,7 +52,7 @@ fn iso_plays_back_like_a_sacd_reader() {
     let area1_start = be32(&m, 0x40);
     let area1_size = be16(&m, 0x54);
     assert_eq!(area1_start, toc::AREA_TOC_1_START); // 540
-    assert_eq!(area1_size, toc::AREA_TOC_SECTORS as u16); // 6
+    assert_eq!(area1_size, toc::AREA_TOC_SECTORS); // 6
     for i in 1..9u32 {
         assert_eq!(&sec(&mut iso, 510 + i)[0..8], b"SACDText");
     }
