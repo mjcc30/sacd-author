@@ -39,6 +39,9 @@ pub enum SacdError {
 
     #[error("{path}: not a DoP (DSD-over-PCM) WAV file: {msg}")]
     NotDop { path: PathBuf, msg: String },
+
+    #[error("invalid parameter: {msg}")]
+    InvalidParams { msg: String },
 }
 
 pub type Result<T> = std::result::Result<T, SacdError>;

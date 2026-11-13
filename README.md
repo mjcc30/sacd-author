@@ -40,9 +40,12 @@ sacd-author data-iso track01.flac track02.flac ... -o music.iso
 # input: .dsf / .dff / DoP .wav file, or a SACD-R .iso (then -o is a directory,
 # one output file per track); output format from the extension (.wav/.flac/.wv)
 sacd-author dsd2pcm track01.dsf -o track01.flac -r 96000 -b 24
-sacd-author dsd2pcm album.iso  -o album_pcm/ -f flac -r 176400   # max fidelity
-sacd-author dsd2pcm track.wv    # via -f or output extension .wv (WavPack)
+sacd-author dsd2pcm album.iso  -o album_pcm/ -f flac -r 192000   # FLAC max: 24 bit / 192 kHz
+sacd-author dsd2pcm track.dsf -o track.wav -r 384000 -b 32       # WAV/WavPack max: 32 bit / 384 kHz
 ```
+
+Output limits: WAV and WavPack accept 16/24/32 bit up to 384 kHz; FLAC is
+capped at 24 bit / 192 kHz (checked by the CLI).
 
 Notes on `dsd2pcm`: the DSD noise shaper puts huge ultrasonic noise above
 ~20-30 kHz, so the anti-alias low-pass (default: min(50 kHz, 0.45 x rate),

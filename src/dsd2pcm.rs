@@ -53,6 +53,44 @@ pub fn supported_rate(rate: u32) -> bool {
     )
 }
 
+impl PcmFormat {
+    /// Max bit depth and sample rate for this output format.
+    pub fn limits(self) -> (u8, u32) {
+        match self {
+            // WAV: integer PCM up to 32 bit / 384 kHz
+            PcmFormat::Wav => (32, 384_000),
+            // FLAC: up to 24 bit / 192 kHz (practical FLAC ceiling)
+            PcmFormat::Flac => (24, 192_000),
+            // WavPack: integer PCM up to 32 bit / 384 kHz
+            PcmFormat::Wv => (32, 384_000),
+        }
+    }
+}
+
+/// Check that `params` are within the limits of `fmt`.
+pub fn validate_params(fmt: PcmFormat, params: &PcmParams) -> Result<()> {
+    let (max_bits, max_rate) = fmt.limits();
+    if !supported_rate(params.rate) || params.rate > max_rate {
+        return Err(SacdError::InvalidParams {
+            msg: format!(
+                "rate {} Hz not supported for {} (max {max_rate} Hz)",
+                params.rate,
+                fmt.ext()
+            ),
+        });
+    }
+    if !matches!(params.bits, 16 | 24 | 32) || params.bits > max_bits {
+        return Err(SacdError::InvalidParams {
+            msg: format!(
+                "bit depth {} not supported for {} (max {max_bits} bits)",
+                params.bits,
+                fmt.ext()
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PcmFormat {
     Wav,
@@ -312,14 +350,12 @@ impl WavSink {
 
 impl PcmSink for WavSink {
     fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
-        let mut buf = Vec::with_capacity(samples.len() * self.bits as usize / 8);
+        let shift = 32 - self.bits;
+        let nbytes = self.bits as usize / 8;
+        let mut buf = Vec::with_capacity(samples.len() * nbytes);
         for &s in samples {
-            if self.bits == 24 {
-                let v = (s >> 8) as u32 & 0xFF_FFFF;
-                buf.extend_from_slice(&v.to_le_bytes()[..3]);
-            } else {
-                buf.extend_from_slice(&(s >> 16).to_le_bytes());
-            }
+            let v = (s >> shift) as u32; // two's complement, low nbytes are the sample
+            buf.extend_from_slice(&v.to_le_bytes()[..nbytes]);
         }
         self.data_bytes += buf.len() as u64;
         self.file.write_all(&buf)
@@ -357,7 +393,7 @@ impl FlacSink {
 impl PcmSink for FlacSink {
     fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
         // shift full-scale i32 down to the target bit depth
-        let shift = if self.bits == 24 { 8 } else { 16 };
+        let shift = 32 - self.bits;
         let v: Vec<i32> = samples.iter().map(|s| s >> shift).collect();
         self.enc
             .push_interleaved(&v)
@@ -389,7 +425,7 @@ impl WvSink {
 
 impl PcmSink for WvSink {
     fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
-        let shift = if self.params.bits == 24 { 8 } else { 16 };
+        let shift = 32 - self.params.bits;
         self.buf.extend(samples.iter().map(|s| s >> shift));
         Ok(())
     }
@@ -593,7 +629,7 @@ mod tests {
     }
 
     /// Build a DSF whose data chunk is `data` (block-interleaved L/R blocks).
-    fn dsf_with_data(data: &[u8]) -> (tempfile::NamedTempFile, DsfInfo) {
+    pub(super) fn dsf_with_data(data: &[u8]) -> (tempfile::NamedTempFile, DsfInfo) {
         let samples = (data.len() / 2) as u64 * 8;
         let mut bytes = crate::testutil::make_test_dsf(samples, false);
         let off = 92;
@@ -643,7 +679,7 @@ mod tests {
         assert!((2228..2228 + 3000).contains(&fa), "frames {fa}");
     }
 
-    fn parse_wav(path: &Path) -> (u32, u16, u16, u16, Vec<u8>) {
+    pub(super) fn parse_wav(path: &Path) -> (u32, u16, u16, u16, Vec<u8>) {
         let b = std::fs::read(path).unwrap();
         assert_eq!(&b[0..4], b"RIFF");
         assert_eq!(&b[8..12], b"WAVE");
@@ -762,5 +798,84 @@ mod tests {
         let n = (frames_direct as usize) * 6; // compare the common prefix
         assert_eq!(&pcm[..n], &direct24[..n], "ISO vs DSF PCM prefix mismatch");
         drop(dsf_file);
+    }
+}
+
+#[cfg(test)]
+mod limits_tests {
+    use super::tests::{dsf_with_data, parse_wav};
+    use super::*;
+    use crate::testutil::pattern;
+
+    #[test]
+    fn format_limits_are_enforced() {
+        let p = |rate, bits| PcmParams {
+            rate,
+            bits,
+            lowpass: None,
+            gain_db: 0.0,
+        };
+        // WAV: 32 bit / 384 kHz allowed
+        assert!(validate_params(PcmFormat::Wav, &p(384_000, 32)).is_ok());
+        assert!(validate_params(PcmFormat::Wav, &p(44_100, 16)).is_ok());
+        // FLAC: capped at 24 bit / 192 kHz
+        assert!(validate_params(PcmFormat::Flac, &p(192_000, 24)).is_ok());
+        assert!(validate_params(PcmFormat::Flac, &p(384_000, 24)).is_err());
+        assert!(validate_params(PcmFormat::Flac, &p(96_000, 32)).is_err());
+        // WavPack: 32 bit / 384 kHz allowed
+        assert!(validate_params(PcmFormat::Wv, &p(384_000, 32)).is_ok());
+        // bogus values rejected everywhere
+        assert!(validate_params(PcmFormat::Wav, &p(12345, 24)).is_err());
+        assert!(validate_params(PcmFormat::Wav, &p(96_000, 8)).is_err());
+    }
+
+    #[test]
+    fn wav_32bit_384k() {
+        let data = pattern(8192, 555);
+        let (_f, info) = dsf_with_data(&data);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = PcmParams {
+            rate: 384_000,
+            bits: 32,
+            lowpass: None,
+            gain_db: 0.0,
+        };
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Wav, &params).unwrap();
+        let (rate, ch, bits, tag, pcm) = parse_wav(&out_path);
+        assert_eq!((tag, ch, rate, bits), (1, 2, 384_000, 32));
+        assert_eq!(pcm.len(), frames as usize * 2 * 4);
+        // 32768 samples/ch -> 32768*384000/2822400 = 4457 frames (+ tail)
+        assert!((4457..4457 + 3000).contains(&frames), "frames {frames}");
+    }
+
+    #[test]
+    fn flac_24bit_192k() {
+        let data = pattern(8192, 777);
+        let (_f, info) = dsf_with_data(&data);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = PcmParams {
+            rate: 192_000,
+            bits: 24,
+            lowpass: None,
+            gain_db: 0.0,
+        };
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Flac, &params).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        let (si, planes) = rusty_flac::decode(&bytes).unwrap();
+        assert_eq!(
+            (si.sample_rate, si.channels, si.bits_per_sample),
+            (192_000, 2, 24)
+        );
+        assert!((planes[0].len() as i64 - frames as i64).abs() < 64);
+        // cross-check with claxon
+        let mut reader = claxon::FlacReader::open(&out_path).unwrap();
+        let si2 = reader.streaminfo();
+        assert_eq!(
+            (si2.sample_rate, si2.channels, si2.bits_per_sample),
+            (192_000, 2, 24)
+        );
+        assert_eq!(reader.samples().count(), planes[0].len() * 2);
     }
 }

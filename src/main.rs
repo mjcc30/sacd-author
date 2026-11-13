@@ -242,8 +242,8 @@ fn dsd2pcm_cmd(
             "unsupported rate {rate} (use 44100/48000/88200/96000/176400/192000/352800/384000)"
         );
     }
-    if !matches!(bits, 16 | 24) {
-        anyhow::bail!("unsupported bit depth {bits} (use 16 or 24)");
+    if !matches!(bits, 16 | 24 | 32) {
+        anyhow::bail!("unsupported bit depth {bits} (use 16, 24 or 32)");
     }
     let fmt = dsd2pcm::PcmFormat::from_ext(format)
         .ok_or_else(|| anyhow::anyhow!("unknown format '{format}' (use flac, wav or wv)"))?;
@@ -258,6 +258,18 @@ fn dsd2pcm_cmd(
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("iso"))
         .unwrap_or(false);
+    let effective_fmt = if is_iso {
+        fmt
+    } else {
+        output
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(dsd2pcm::PcmFormat::from_ext)
+            .unwrap_or(fmt)
+    };
+    if let Err(e) = dsd2pcm::validate_params(effective_fmt, &params) {
+        anyhow::bail!("{e}");
+    }
     println!(
         "{}: DSD64 -> PCM {} Hz, {} bit, lowpass {} Hz, gain {:+.1} dB",
         input.display(),
