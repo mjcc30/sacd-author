@@ -86,7 +86,9 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
             rate: sample_rate,
         });
     }
-    if channels != 2 {
+    // DSF is stereo-only by spec; DFF also carries the SACD multichannel
+    // area (up to 6 channels), which we accept for MC extraction/conversion.
+    if !(2..=6).contains(&channels) {
         return Err(SacdError::UnsupportedChannels {
             path: path.to_path_buf(),
             channels: channels as u32,
@@ -168,92 +170,26 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Build a minimal DFF with one block pair of `fill` audio data.
-    pub fn make_test_dff(fill: u8, title: Option<&str>) -> Vec<u8> {
-        let audio = vec![fill; 8192];
-        let mut prop = b"SND ".to_vec();
-        let fs = {
-            let mut c = b"FS  ".to_vec();
-            c.extend_from_slice(&4u64.to_be_bytes());
-            c.extend_from_slice(&2_822_400u32.to_be_bytes());
-            c
-        };
-        let chnl = {
-            let mut c = b"CHNL".to_vec();
-            c.extend_from_slice(&2u64.to_be_bytes());
-            c.extend_from_slice(&2u16.to_be_bytes());
-            c
-        };
-        let cmpr = {
-            let mut c = b"CMPR".to_vec();
-            c.extend_from_slice(&5u64.to_be_bytes());
-            c.extend_from_slice(b"DSD ");
-            c.push(0);
-            c
-        };
-        prop.extend_from_slice(&fs);
-        prop.extend_from_slice(&chnl);
-        prop.extend_from_slice(&cmpr);
-        let mut prop_chunk = b"PROP".to_vec();
-        prop_chunk.extend_from_slice(&(prop.len() as u64).to_be_bytes());
-        prop_chunk.extend_from_slice(&prop);
-
-        let mut id3_body = Vec::new();
-        if let Some(t) = title {
-            let mut payload = vec![3u8];
-            payload.extend_from_slice(t.as_bytes());
-            let synch = |n: u32| {
-                [
-                    (n >> 21 & 0x7F) as u8,
-                    (n >> 14 & 0x7F) as u8,
-                    (n >> 7 & 0x7F) as u8,
-                    (n & 0x7F) as u8,
-                ]
-            };
-            let mut body = Vec::new();
-            body.extend_from_slice(b"TIT2");
-            body.extend_from_slice(&synch(payload.len() as u32));
-            body.extend_from_slice(&[0, 0]);
-            body.extend_from_slice(&payload);
-            id3_body.extend_from_slice(b"ID3");
-            id3_body.extend_from_slice(&[4, 0, 0]);
-            id3_body.extend_from_slice(&synch(body.len() as u32));
-            id3_body.extend_from_slice(&body);
-        }
-        let id3 = id3_body;
-
-        fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
-            let mut c = id.to_vec();
-            c.extend_from_slice(&(body.len() as u64).to_be_bytes());
-            c.extend_from_slice(body);
-            if body.len() % 2 == 1 {
-                c.push(0);
-            }
-            c
-        }
-        let fver = chunk(b"FVER", &0x01050000u32.to_be_bytes());
-        let prop_chunk = chunk(b"PROP", &prop);
-        let dsd_chunk = chunk(b"DSD ", &audio);
-        let id3c = if id3.is_empty() {
-            Vec::new()
-        } else {
-            chunk(b"ID3 ", &id3)
-        };
-        let body_len = fver.len() + prop_chunk.len() + dsd_chunk.len() + id3c.len();
-        let mut out = b"FRM8".to_vec();
-        out.extend_from_slice(&(body_len as u64 + 4).to_be_bytes());
-        out.extend_from_slice(b"DSD ");
-        out.extend_from_slice(&fver);
-        out.extend_from_slice(&prop_chunk);
-        out.extend_from_slice(&dsd_chunk);
-        out.extend_from_slice(&id3c);
-        out
+    #[test]
+    fn accepts_multichannel_and_rejects_bad_counts() {
+        let path = Path::new("mc.dff");
+        // 4 channels, one 4096-byte block per channel
+        let audio = vec![0x11; 4 * 4096];
+        let d = crate::testutil::make_test_dff(&audio, 4, None);
+        let info = parse_bytes(&d, path).unwrap();
+        assert_eq!(info.channels, 4);
+        assert_eq!(info.samples_per_channel, 4096 * 8);
+        let d7 = crate::testutil::make_test_dff(&vec![0; 7 * 4096], 7, None);
+        assert!(matches!(
+            parse_bytes(&d7, path),
+            Err(SacdError::UnsupportedChannels { channels: 7, .. })
+        ));
     }
 
     #[test]
     fn parses_dff_header_and_audio() {
         let path = Path::new("t.dff");
-        let d = make_test_dff(0xD5, Some("DFF Song"));
+        let d = crate::testutil::make_test_dff(&vec![0xD5; 8192], 2, Some("DFF Song"));
         let info = parse_bytes(&d, path).unwrap();
         assert_eq!(info.sample_rate, 2_822_400);
         assert_eq!(info.channels, 2);
@@ -272,7 +208,7 @@ mod tests {
         dsf_file.write_all(&dsf_data).unwrap();
         let dsf_info = crate::dsf::parse_bytes(&dsf_data, dsf_file.path()).unwrap();
 
-        let dff_data = make_test_dff(0xD5, None);
+        let dff_data = crate::testutil::make_test_dff(&vec![0xD5; 8192], 2, None);
         let mut dff_file = tempfile::NamedTempFile::new().unwrap();
         dff_file.write_all(&dff_data).unwrap();
         let dff_info = parse_bytes(&dff_data, dff_file.path()).unwrap();

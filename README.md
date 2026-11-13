@@ -47,6 +47,12 @@ sacd-author dsd2pcm track.dsf -o track.wav -r 384000 -b 32       # WAV/WavPack m
 Output limits: WAV and WavPack accept 16/24/32 bit up to 384 kHz; FLAC is
 capped at 24 bit / 192 kHz (checked by the CLI).
 
+Multichannel: `dsd2pcm` also accepts **multichannel DFF** (2-6 channels, e.g.
+the multichannel area of a SACD) and converts it to multichannel PCM — WAV
+(any channel count) and FLAC (up to 8 channels) carry all channels; WavPack
+stays stereo-only (wavicle encoder limitation) and is rejected with a clear
+error for >2 channels. DSF and DoP-WAV inputs remain stereo-only.
+
 Notes on `dsd2pcm`: the DSD noise shaper puts huge ultrasonic noise above
 ~20-30 kHz, so the anti-alias low-pass (default: min(50 kHz, 0.45 x rate),
 override with `--lowpass`) runs before decimation — without it that noise

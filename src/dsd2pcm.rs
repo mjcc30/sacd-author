@@ -124,6 +124,7 @@ struct DsdBlockReader {
     file: File,
     remaining_raw: u64,
     dop: bool,
+    channels: usize,
     eof: bool,
 }
 
@@ -131,6 +132,13 @@ impl DsdBlockReader {
     fn open(info: &DsfInfo) -> std::io::Result<Self> {
         let mut file = File::open(&info.path)?;
         file.seek(SeekFrom::Start(info.data_offset))?;
+        let channels = info.channels as usize;
+        if info.packing == AudioPacking::Dop && channels != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DoP (WAV-DSD) input must be stereo",
+            ));
+        }
         let remaining_raw = if info.packing == AudioPacking::Dop {
             info.data_size / SECTOR_PAIR_BYTES as u64 * DOP_GROUP_BYTES as u64
         } else {
@@ -140,6 +148,7 @@ impl DsdBlockReader {
             file,
             remaining_raw,
             dop: info.packing == AudioPacking::Dop,
+            channels,
             eof: false,
         })
     }
@@ -159,12 +168,16 @@ impl DsdBlockReader {
         Ok(read)
     }
 
-    fn next_block(&mut self) -> std::io::Result<Option<[u8; SECTOR_PAIR_BYTES]>> {
+    /// Next interleaved block: 4096*channels bytes, sample-interleaved
+    /// (ch0[0], ch1[0], ..., chC-1[0], ch0[1], ...).
+    fn next_block(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         if self.eof || self.remaining_raw == 0 {
             return Ok(None);
         }
-        let mut pair = [0u8; SECTOR_PAIR_BYTES];
+        let c = self.channels;
+        let mut block = vec![0u8; 4096 * c];
         if self.dop {
+            // stereo only (enforced in open())
             let mut chunk = [0u8; DOP_GROUP_BYTES];
             let n = self.read_padded(&mut chunk)?;
             if n == 0 {
@@ -174,36 +187,42 @@ impl DsdBlockReader {
             let samples = (n / 6).min(SAMPLES_PER_BLOCK_PAIR);
             for s in 0..samples {
                 let b = &chunk[s * 6..s * 6 + 6];
-                pair[4 * s] = b[0];
-                pair[4 * s + 1] = b[3];
-                pair[4 * s + 2] = b[1];
-                pair[4 * s + 3] = b[4];
+                block[4 * s] = b[0];
+                block[4 * s + 1] = b[3];
+                block[4 * s + 2] = b[1];
+                block[4 * s + 3] = b[4];
             }
         } else {
-            let mut l = [0u8; 4096];
-            let mut r = [0u8; 4096];
-            let nl = self.read_padded(&mut l[..4096.min(self.remaining_raw as usize)])?;
-            let nr = self.read_padded(&mut r[..4096.min(self.remaining_raw as usize)])?;
-            if nl == 0 && nr == 0 {
+            // DSF/DFF layout: C channel blocks of 4096 bytes, block by block
+            let mut chan_blocks = vec![vec![0u8; 4096]; c];
+            let mut any = 0usize;
+            for cb in chan_blocks.iter_mut() {
+                let want = 4096.min(self.remaining_raw as usize);
+                any += self.read_padded(&mut cb[..want])?;
+            }
+            if any == 0 {
                 self.eof = true;
                 return Ok(None);
             }
             for i in 0..4096 {
-                pair[2 * i] = l[i];
-                pair[2 * i + 1] = r[i];
+                for ch in 0..c {
+                    block[i * c + ch] = chan_blocks[ch][i];
+                }
             }
         }
-        Ok(Some(pair))
+        Ok(Some(block))
     }
 }
 
-/// Convert a stream of 8192-byte interleaved DSD blocks to interleaved i32
-/// PCM (full-scale i32; shift right for 24/16-bit output), calling `sink`
-/// with chunks. Returns the number of output frames.
+/// Convert a stream of interleaved DSD blocks (4096*channels bytes each,
+/// sample-interleaved across channels) to interleaved i32 PCM (full-scale
+/// i32; shift right for 24/16-bit output), calling `sink` with chunks.
+/// Returns the number of output frames.
 pub fn convert_blocks(
-    mut next_block: impl FnMut() -> std::io::Result<Option<[u8; SECTOR_PAIR_BYTES]>>,
+    mut next_block: impl FnMut() -> std::io::Result<Option<Vec<u8>>>,
     msb_first: bool,
     dsd_rate: u32,
+    channels: usize,
     params: &PcmParams,
     mut sink: impl FnMut(&[i32]),
 ) -> std::io::Result<u64> {
@@ -215,24 +234,22 @@ pub fn convert_blocks(
         k += 1;
     }
     let fs_mid = fs_d >> k;
-    let mut r1_l = Polyphase::new(
-        fs_d,
-        fs_mid,
-        0.45 * fs_mid as f64,
-        fs_mid as f64 / 2.0,
-        100.0,
-    );
-    let mut r1_r = Polyphase::new(
-        fs_d,
-        fs_mid,
-        0.45 * fs_mid as f64,
-        fs_mid as f64 / 2.0,
-        100.0,
-    );
+    let mut r1: Vec<Polyphase> = (0..channels)
+        .map(|_| {
+            Polyphase::new(
+                fs_d,
+                fs_mid,
+                0.45 * fs_mid as f64,
+                fs_mid as f64 / 2.0,
+                100.0,
+            )
+        })
+        .collect();
     let fc = params.lowpass.unwrap_or(50_000.0).min(0.45 * rate as f64);
     let use_stage2 = fs_mid != rate;
-    let mut r2_l = use_stage2.then(|| Polyphase::new(fs_mid, rate, fc, rate as f64 / 2.0, 100.0));
-    let mut r2_r = use_stage2.then(|| Polyphase::new(fs_mid, rate, fc, rate as f64 / 2.0, 100.0));
+    let mut r2: Vec<Option<Polyphase>> = (0..channels)
+        .map(|_| use_stage2.then(|| Polyphase::new(fs_mid, rate, fc, rate as f64 / 2.0, 100.0)))
+        .collect();
 
     let gain = 10f64.powf(params.gain_db / 20.0);
     let to_i32 = |y: f64| -> i32 {
@@ -241,67 +258,58 @@ pub fn convert_blocks(
     };
 
     let mut frames_out = 0u64;
-    let process = |mid_l: &[f64],
-                   mid_r: &[f64],
-                   r2_l: &mut Option<Polyphase>,
-                   r2_r: &mut Option<Polyphase>,
+    // run per-channel mid-rate vectors through stage 2 and emit interleaved
+    let process = |mids: &[Vec<f64>],
+                   r2: &mut [Option<Polyphase>],
                    sink: &mut dyn FnMut(&[i32]),
                    frames_out: &mut u64| {
-        let (out_l, out_r) = match (r2_l, r2_r) {
-            (Some(a), Some(b)) => (a.push(mid_l), b.push(mid_r)),
-            _ => (mid_l.to_vec(), mid_r.to_vec()),
-        };
-        let n = out_l.len().min(out_r.len());
-        let mut buf = Vec::with_capacity(n * 2);
+        let mut outs: Vec<Vec<f64>> = Vec::with_capacity(channels);
+        for (r, mid) in r2.iter_mut().zip(mids.iter()) {
+            outs.push(match r {
+                Some(r) => r.push(mid),
+                None => mid.clone(),
+            });
+        }
+        let n = outs.iter().map(|v| v.len()).min().unwrap_or(0);
+        let mut buf = Vec::with_capacity(n * channels);
         for i in 0..n {
-            buf.push(to_i32(out_l[i]));
-            buf.push(to_i32(out_r[i]));
+            for out in outs.iter() {
+                buf.push(to_i32(out[i]));
+            }
         }
         *frames_out += n as u64;
         sink(&buf);
     };
 
-    while let Some(pair) = next_block()? {
-        let l_bytes: Vec<u8> = pair.iter().step_by(2).copied().collect();
-        let r_bytes: Vec<u8> = pair.iter().skip(1).step_by(2).copied().collect();
-        let mut bl = Vec::with_capacity(4096 * 8);
-        let mut br = Vec::with_capacity(4096 * 8);
-        expand_bits(&l_bytes, msb_first, &mut bl);
-        expand_bits(&r_bytes, msb_first, &mut br);
-        let mid_l = r1_l.push(&bl);
-        let mid_r = r1_r.push(&br);
-        process(
-            &mid_l,
-            &mid_r,
-            &mut r2_l,
-            &mut r2_r,
-            &mut sink,
-            &mut frames_out,
-        );
-    }
-    // flush both stages
-    let mid_l = r1_l.finish();
-    let mid_r = r1_r.finish();
-    process(
-        &mid_l,
-        &mid_r,
-        &mut r2_l,
-        &mut r2_r,
-        &mut sink,
-        &mut frames_out,
-    );
-    if let (Some(a), Some(b)) = (&mut r2_l, &mut r2_r) {
-        let out_l = a.finish();
-        let out_r = b.finish();
-        let n = out_l.len().min(out_r.len());
-        let mut buf = Vec::with_capacity(n * 2);
-        for i in 0..n {
-            buf.push(to_i32(out_l[i]));
-            buf.push(to_i32(out_r[i]));
+    while let Some(block) = next_block()? {
+        let mut mids = Vec::with_capacity(channels);
+        for (c, r) in r1.iter_mut().enumerate() {
+            let bytes: Vec<u8> = block.iter().skip(c).step_by(channels).copied().collect();
+            let mut bits = Vec::with_capacity(bytes.len() * 8);
+            expand_bits(&bytes, msb_first, &mut bits);
+            mids.push(r.push(&bits));
         }
-        frames_out += n as u64;
-        sink(&buf);
+        process(&mids, &mut r2, &mut sink, &mut frames_out);
     }
+    // flush stage 1, then stage 2
+    let mids: Vec<Vec<f64>> = r1.iter_mut().map(|r| r.finish()).collect();
+    process(&mids, &mut r2, &mut sink, &mut frames_out);
+    let outs: Vec<Vec<f64>> = r2
+        .iter_mut()
+        .map(|r| match r {
+            Some(r) => r.finish(),
+            None => Vec::new(),
+        })
+        .collect();
+    let n = outs.iter().map(|v| v.len()).min().unwrap_or(0);
+    let mut buf = Vec::with_capacity(n * channels);
+    for i in 0..n {
+        for out in outs.iter() {
+            buf.push(to_i32(out[i]));
+        }
+    }
+    frames_out += n as u64;
+    sink(&buf);
     Ok(frames_out)
 }
 
@@ -319,9 +327,9 @@ struct WavSink {
 }
 
 impl WavSink {
-    fn create(path: &Path, params: &PcmParams) -> std::io::Result<Self> {
+    fn create(path: &Path, params: &PcmParams, channels: u32) -> std::io::Result<Self> {
         let mut file = File::create(path)?;
-        let ch = 2u16;
+        let ch = channels as u16;
         let bits = params.bits as u16;
         let block_align = ch * bits / 8;
         let byte_rate = params.rate * block_align as u32;
@@ -379,8 +387,14 @@ struct FlacSink {
 }
 
 impl FlacSink {
-    fn create(path: &Path, params: &PcmParams) -> std::io::Result<Self> {
-        let enc = rusty_flac::Encoder::new(params.rate, 2, params.bits as u32)
+    fn create(path: &Path, params: &PcmParams, channels: u32) -> std::io::Result<Self> {
+        if channels > 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("FLAC encoder supports at most 8 channels (got {channels})"),
+            ));
+        }
+        let enc = rusty_flac::Encoder::new(params.rate, channels, params.bits as u32)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
         Ok(FlacSink {
             path: path.to_path_buf(),
@@ -410,16 +424,26 @@ impl PcmSink for FlacSink {
 struct WvSink {
     path: PathBuf,
     params: PcmParams,
+    channels: u32,
     buf: Vec<i32>,
 }
 
 impl WvSink {
-    fn create(path: &Path, params: PcmParams) -> Self {
-        WvSink {
+    fn create(path: &Path, params: PcmParams, channels: u32) -> std::io::Result<Self> {
+        if channels > 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "WavPack output supports at most 2 channels (wavicle encoder limitation, got {channels}); use wav or flac for multichannel"
+                ),
+            ));
+        }
+        Ok(WvSink {
             path: path.to_path_buf(),
             params,
+            channels,
             buf: Vec::new(),
-        }
+        })
     }
 }
 
@@ -432,7 +456,7 @@ impl PcmSink for WvSink {
 
     fn finish(self: Box<Self>) -> std::io::Result<()> {
         let params = wavicle::EncodeParams {
-            channels: 2,
+            channels: self.channels,
             sample_rate: self.params.rate,
             bits_per_sample: self.params.bits as u32,
         };
@@ -446,11 +470,12 @@ fn make_sink(
     path: &Path,
     format: PcmFormat,
     params: &PcmParams,
+    channels: u32,
 ) -> std::io::Result<Box<dyn PcmSink>> {
     match format {
-        PcmFormat::Wav => Ok(Box::new(WavSink::create(path, params)?)),
-        PcmFormat::Flac => Ok(Box::new(FlacSink::create(path, params)?)),
-        PcmFormat::Wv => Ok(Box::new(WvSink::create(path, *params))),
+        PcmFormat::Wav => Ok(Box::new(WavSink::create(path, params, channels)?)),
+        PcmFormat::Flac => Ok(Box::new(FlacSink::create(path, params, channels)?)),
+        PcmFormat::Wv => Ok(Box::new(WvSink::create(path, *params, channels)?)),
     }
 }
 
@@ -515,11 +540,12 @@ pub fn convert_dsf_info(
         path: info.path.clone(),
         source: e,
     })?;
-    let mut sink = make_sink(out, fmt, params).map_err(io)?;
+    let mut sink = make_sink(out, fmt, params, info.channels).map_err(io)?;
     let frames = convert_blocks(
         || reader.next_block(),
         !info.bit_reverse_needed,
         info.sample_rate,
+        info.channels as usize,
         params,
         |s| sink.push(s).unwrap(),
     )
@@ -538,7 +564,7 @@ fn convert_iso_track(
 ) -> Result<u64> {
     let data = track.data.clone();
     let mut pos = 0usize;
-    let mut sink = make_sink(out, fmt, params).map_err(|e| SacdError::Io {
+    let mut sink = make_sink(out, fmt, params, 2).map_err(|e| SacdError::Io {
         path: out.to_path_buf(),
         source: e,
     })?;
@@ -557,10 +583,11 @@ fn convert_iso_track(
                 pair[2 * i] = chunk[i];
                 pair[2 * i + 1] = chunk[SECTOR_PAIR_BYTES / 2 + i];
             }
-            Ok(Some(pair))
+            Ok(Some(pair.to_vec()))
         },
         false, // DSF bit order = LSB first
         DSD64,
+        2, // the 2C (stereo) audio area of a SACD-R
         params,
         |s| sink.push(s).unwrap(),
     )
@@ -621,6 +648,7 @@ mod tests {
             || reader.next_block(),
             !info.bit_reverse_needed,
             info.sample_rate,
+            info.channels as usize,
             params,
             |s| v.extend_from_slice(s),
         )
@@ -661,7 +689,7 @@ mod tests {
 
         // equivalent DFF: same stream in native (bit-reversed) order
         let native: Vec<u8> = data.iter().map(|b| b.reverse_bits()).collect();
-        let dff_bytes = make_test_dff(&native, None);
+        let dff_bytes = make_test_dff(&native, 2, None);
         let mut dff_file = tempfile::NamedTempFile::new().unwrap();
         dff_file.write_all(&dff_bytes).unwrap();
         let dff_info = crate::dff::parse_bytes(&dff_bytes, dff_file.path()).unwrap();
@@ -764,6 +792,98 @@ mod tests {
         assert_eq!(dec.channels, 2);
         assert_eq!(dec.bits_per_sample, 16);
         assert!((dec.samples.len() as i64 / 2 - frames as i64).abs() < 64);
+    }
+
+    /// Build a multichannel DFF with `blocks` 4096-byte blocks per channel.
+    fn dff_with_channels(channels: u16, blocks: usize) -> (tempfile::NamedTempFile, DsfInfo) {
+        let audio = pattern(4096 * channels as usize * blocks, 0x5A5A);
+        let bytes = make_test_dff(&audio, channels, Some("mc test"));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        let info = crate::dff::parse_bytes(&bytes, f.path()).unwrap();
+        (f, info)
+    }
+
+    #[test]
+    fn multichannel_dff_to_wav() {
+        let (_f, info) = dff_with_channels(4, 2);
+        assert_eq!(info.channels, 4);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = test_params();
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Wav, &params).unwrap();
+        let (rate, ch, bits, tag, pcm) = parse_wav(&out_path);
+        assert_eq!((tag, ch, rate, bits), (1, 4, 96_000, 24));
+        assert_eq!(pcm.len(), frames as usize * 4 * 3);
+        // 2 blocks * 4096 bytes * 8 = 65536 samples/ch -> 2228 frames at 96k
+        assert!((2228..2228 + 3000).contains(&frames), "frames {frames}");
+    }
+
+    #[test]
+    fn multichannel_dff_to_flac() {
+        let (_f, info) = dff_with_channels(6, 1);
+        assert_eq!(info.channels, 6);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = test_params();
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Flac, &params).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(&bytes[0..4], b"fLaC");
+        let (si, planes) = rusty_flac::decode(&bytes).unwrap();
+        assert_eq!(si.channels, 6);
+        assert_eq!(si.sample_rate, 96_000);
+        assert_eq!(si.bits_per_sample, 24);
+        assert_eq!(planes.len(), 6);
+        assert!((planes[0].len() as i64 - frames as i64).abs() < 64);
+        let mut reader = claxon::FlacReader::open(&out_path).unwrap();
+        assert_eq!(reader.streaminfo().channels, 6);
+        assert_eq!(reader.samples().count(), planes[0].len() * 6);
+    }
+
+    #[test]
+    fn multichannel_wavpack_is_rejected() {
+        let (_f, info) = dff_with_channels(4, 1);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = test_params();
+        let err = convert_dsf_info(&info, &out_path, PcmFormat::Wv, &params).unwrap_err();
+        assert!(
+            err.to_string().contains("2 channels"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn multichannel_wav_and_flac_agree() {
+        let (_f, info) = dff_with_channels(4, 1);
+        let params = test_params();
+        let wav_out = tempfile::NamedTempFile::new().unwrap();
+        let wav_path = wav_out.path().to_path_buf();
+        let frames_wav = convert_dsf_info(&info, &wav_path, PcmFormat::Wav, &params).unwrap();
+        let (_r, _c, _b, _t, pcm_wav) = parse_wav(&wav_path);
+        let flac_out = tempfile::NamedTempFile::new().unwrap();
+        let flac_path = flac_out.path().to_path_buf();
+        let frames_flac = convert_dsf_info(&info, &flac_path, PcmFormat::Flac, &params).unwrap();
+        let bytes = std::fs::read(&flac_path).unwrap();
+        let (_si, planes) = rusty_flac::decode(&bytes).unwrap();
+        assert_eq!(frames_wav, frames_flac);
+        let n = planes[0].len().min(frames_wav as usize);
+        for i in 0..n {
+            for c in 0..4 {
+                let w = u32::from_le_bytes([
+                    pcm_wav[(i * 4 + c) * 3],
+                    pcm_wav[(i * 4 + c) * 3 + 1],
+                    pcm_wav[(i * 4 + c) * 3 + 2],
+                    0,
+                ]);
+                let ws = if w & 0x80_0000 != 0 {
+                    w as i32 - 0x100_0000
+                } else {
+                    w as i32
+                };
+                assert_eq!(ws, planes[c][i], "sample mismatch at frame {i} ch {c}");
+            }
+        }
     }
 
     #[test]
