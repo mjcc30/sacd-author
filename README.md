@@ -3,6 +3,15 @@
 Open-source Rust SACD authoring tool to convert DSF files into burnable SACD-R ISO images
 (target: Sony BDP-S490 / MediaTek MT8580).
 
+## Supported formats
+
+Input/output audio is **native DSD64 only**: DSF and DFF (both accepted as
+input by extension; `extract` writes DSF by default, DFF with `-f dff`).
+PCM formats (FLAC, WAV, WavPack, ...) are intentionally not supported: a
+SACD-R needs 1-bit DSD, and PCM->DSD requires a lossy sigma-delta
+modulation that is out of scope. Convert PCM to DSF first with an external
+tool (sox/JRiver/dsd tools), then use sacd-author.
+
 ## Usage
 
 ```bash
