@@ -92,10 +92,69 @@ pub fn write_dsf(
     Ok(())
 }
 
+fn be_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut c = id.to_vec();
+    c.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    c.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        c.push(0);
+    }
+    c
+}
+
+/// Write a stereo DSD64 DFF (DSDIFF) file from DSF-layout audio data.
+pub fn write_dff(
+    path: &Path,
+    data: &[u8],
+    _samples_per_channel: u64, // DFF has no sample-count field; derived from data size
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+) -> std::io::Result<()> {
+    let mut prop = b"SND ".to_vec();
+    prop.extend_from_slice(&be_chunk(b"FS  ", &DSD64_SAMPLE_RATE.to_be_bytes()));
+    prop.extend_from_slice(&be_chunk(b"CHNL", &2u16.to_be_bytes()));
+    let mut cmpr = b"DSD ".to_vec();
+    cmpr.push(0);
+    prop.extend_from_slice(&be_chunk(b"CMPR", &cmpr));
+
+    let mut chunks = Vec::new();
+    chunks.extend_from_slice(&be_chunk(b"FVER", &0x0105_0000u32.to_be_bytes()));
+    chunks.extend_from_slice(&be_chunk(b"PROP", &prop));
+    chunks.extend_from_slice(&be_chunk(b"DSD ", data));
+    let id3 = id3v24(title, artist, album);
+    if !id3.is_empty() {
+        chunks.extend_from_slice(&be_chunk(b"ID3 ", &id3));
+    }
+    let mut out = b"FRM8".to_vec();
+    out.extend_from_slice(&((chunks.len() + 4) as u64).to_be_bytes());
+    out.extend_from_slice(b"DSD ");
+    out.extend_from_slice(&chunks);
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(&out)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsf;
+
+    #[test]
+    fn written_dff_parses_back() {
+        let data = vec![0xABu8; 8192];
+        let f = tempfile::NamedTempFile::new().unwrap();
+        write_dff(f.path(), &data, 32768, Some("T"), Some("A"), Some("AL")).unwrap();
+        let bytes = std::fs::read(f.path()).unwrap();
+        let info = crate::dff::parse_bytes(&bytes, f.path()).unwrap();
+        assert_eq!(info.samples_per_channel, 32768);
+        assert_eq!(info.data_size, 8192);
+        assert_eq!(
+            &bytes[info.data_offset as usize..info.data_offset as usize + 8192],
+            &data[..]
+        );
+        assert_eq!(info.tags.title.as_deref(), Some("T"));
+    }
 
     #[test]
     fn written_dsf_parses_back() {

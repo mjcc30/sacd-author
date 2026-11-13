@@ -30,13 +30,16 @@ enum Commands {
         #[arg(short, long, default_value = "output.iso")]
         output: PathBuf,
     },
-    /// Extract DSF tracks from a SACD-R ISO image
+    /// Extract tracks from a SACD-R ISO image (DSF or DFF)
     Extract {
         #[arg(value_name = "ISO")]
         iso: PathBuf,
-        /// Output directory for the .dsf files
+        /// Output directory
         #[arg(short, long, default_value = "extracted")]
         output: PathBuf,
+        /// Output format: dsf (default) or dff
+        #[arg(short = 'f', long, default_value = "dsf")]
+        format: String,
     },
 }
 
@@ -99,7 +102,7 @@ fn convert(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn extract(iso: &std::path::Path, output: &std::path::Path) -> Result<()> {
+fn extract(iso: &std::path::Path, output: &std::path::Path, format: &str) -> Result<()> {
     let img =
         iso_read::read_iso(iso).with_context(|| format!("failed to read {}", iso.display()))?;
     std::fs::create_dir_all(output)?;
@@ -127,16 +130,27 @@ fn extract(iso: &std::path::Path, output: &std::path::Path) -> Result<()> {
                 }
             })
             .collect();
-        let path = output.join(format!("{:02} {safe}.dsf", i + 1));
+        let ext = if format == "dff" { "dff" } else { "dsf" };
+        let path = output.join(format!("{:02} {safe}.{ext}", i + 1));
         let samples = track.data.len() as u64 / 2 * 8;
-        dsf_write::write_dsf(
-            &path,
-            &track.data,
-            samples,
-            track.title.as_deref(),
-            track.performer.as_deref(),
-            img.album_title.as_deref(),
-        )?;
+        match ext {
+            "dff" => dsf_write::write_dff(
+                &path,
+                &track.data,
+                samples,
+                track.title.as_deref(),
+                track.performer.as_deref(),
+                img.album_title.as_deref(),
+            )?,
+            _ => dsf_write::write_dsf(
+                &path,
+                &track.data,
+                samples,
+                track.title.as_deref(),
+                track.performer.as_deref(),
+                img.album_title.as_deref(),
+            )?,
+        }
         println!(
             "  {} ({} bytes, {:.2}s)",
             path.display(),
@@ -151,7 +165,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Convert { inputs, output }) => convert(&inputs, &output),
-        Some(Commands::Extract { iso, output }) => extract(&iso, &output),
+        Some(Commands::Extract {
+            iso,
+            output,
+            format,
+        }) => extract(&iso, &output, &format),
         None => {
             if cli.inputs.is_empty() {
                 Cli::parse_from(["sacd-author", "--help"]);

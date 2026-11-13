@@ -10,8 +10,9 @@ Open-source Rust SACD authoring tool to convert DSF files into burnable SACD-R I
 sacd-author track01.dsf track02.dsf ... -o album.iso
 sacd-author convert track01.dsf track02.dsf -o album.iso
 
-# SACD-R ISO -> DSF tracks (for non-SACD players / archiving)
-sacd-author extract album.iso -o extracted/
+# SACD-R ISO -> DSF or DFF tracks (for non-SACD players / archiving)
+sacd-author extract album.iso -o extracted/              # DSF (default)
+sacd-author extract album.iso -o extracted_dff/ -f dff    # DFF
 ```
 
 - Inputs: stereo DSD64 **DSF or DFF** files (2.8224 MHz), given in track order.
