@@ -30,7 +30,15 @@ sacd-author convert track01.dsf track02.dsf -o album.iso
 # SACD-R ISO -> DSF or DFF tracks (for non-SACD players / archiving)
 sacd-author extract album.iso -o extracted/              # DSF (default)
 sacd-author extract album.iso -o extracted_dff/ -f dff    # DFF
+
+# Plain data ISO from any files (FLAC/WAV/...): burn to DVD-R, readable by
+# any modern player (Sony BDP-S490 plays FLAC 24/96 from disc) — ISO 9660
+# + Joliet, real file names preserved
+sacd-author data-iso track01.flac track02.flac ... -o music.iso
 ```
+
+Burn examples: `growisofs -dvd-compat -Z /dev/sr0=music.iso` (Linux/WSL),
+ImgBurn or `xorriso -as cdrecord` on Windows.
 
 - Inputs: stereo DSD64 (2.8224 MHz) **DSF, DFF or DoP-WAV** files, given in track order.
 - Output: hybrid ISO 9660 + UDF 1.02 image, 2048-byte sectors, `SACD/` folder,

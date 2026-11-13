@@ -44,13 +44,33 @@ pub fn both_u64(v: u64) -> [u8; 16] {
     b
 }
 
-fn a_string(s: &str, len: usize) -> Vec<u8> {
+pub(crate) fn a_string(s: &str, len: usize) -> Vec<u8> {
     let mut v = vec![b' '; len];
     let bytes = s.as_bytes();
     let n = bytes.len().min(len);
     v[..n].copy_from_slice(&bytes[..n]);
     v
 }
+
+/// UCS-2 big-endian string padded with 0x00 to `len` bytes (Joliet encoding).
+pub(crate) fn ucs2be_string(s: &str, len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let n = (len / 2).min(units.len());
+    for (i, u) in units[..n].iter().enumerate() {
+        v[2 * i..2 * i + 2].copy_from_slice(&u.to_be_bytes());
+    }
+    v
+}
+
+/// Joliet escape sequence identifying UCS-2 level 3 ("%/E").
+pub(crate) const JOLIET_ESCAPE: [u8; 32] = {
+    let mut e = [0u8; 32];
+    e[0] = b'%';
+    e[1] = b'/';
+    e[2] = b'E';
+    e
+};
 
 /// 17-byte ISO 9660 ASCII date-time: "YYYYMMDDHHMMSScc" + signed tz byte.
 pub fn iso_date(year: u16, month: u8, day: u8) -> [u8; 17] {
@@ -131,6 +151,44 @@ pub fn pvd(
     s[318..446].copy_from_slice(&a_string("SACD-AUTHOR", 128));
     s[446..574].copy_from_slice(&a_string("SACD-AUTHOR", 128));
     s[574..702].copy_from_slice(&a_string("SACD-AUTHOR ISO9660/UDF HYBRID", 128));
+    s[813..830].copy_from_slice(&iso_date(2026, 1, 1));
+    s[830..847].copy_from_slice(&iso_date(2026, 1, 1));
+    s[864..881].copy_from_slice(&iso_date(2026, 1, 1));
+    s[881] = 1;
+    s
+}
+
+/// Supplementary Volume Descriptor (type 2, Joliet): same layout as the PVD,
+/// but byte 7 is `flags` (0), the 32 reserved bytes at 0x58 hold the UCS-2
+/// escape sequence, and all identifier fields are UCS-2 big-endian.
+pub fn svd(
+    volume_id: &str,
+    volume_sectors: u32,
+    path_table_size: u32,
+    l_path_lba: u32,
+    m_path_lba: u32,
+    root_record: &[u8],
+) -> Vec<u8> {
+    let mut s = vec![0u8; SECTOR];
+    s[0] = 2;
+    s[1..6].copy_from_slice(b"CD001");
+    s[6] = 1;
+    s[7] = 0; // flags
+    s[8..40].copy_from_slice(&ucs2be_string("SACD-AUTHOR", 32));
+    s[40..72].copy_from_slice(&ucs2be_string(volume_id, 32));
+    s[80..88].copy_from_slice(&both_u32(volume_sectors));
+    s[88..120].copy_from_slice(&JOLIET_ESCAPE);
+    s[120..124].copy_from_slice(&both_u16(1));
+    s[124..128].copy_from_slice(&both_u16(1));
+    s[128..132].copy_from_slice(&both_u16(SECTOR as u16));
+    s[132..140].copy_from_slice(&both_u32(path_table_size));
+    s[140..144].copy_from_slice(&l_path_lba.to_le_bytes());
+    s[148..152].copy_from_slice(&m_path_lba.to_be_bytes());
+    s[156..156 + root_record.len()].copy_from_slice(root_record);
+    s[190..318].copy_from_slice(&ucs2be_string("SACD-AUTHOR", 128));
+    s[318..446].copy_from_slice(&ucs2be_string("SACD-AUTHOR", 128));
+    s[446..574].copy_from_slice(&ucs2be_string("SACD-AUTHOR", 128));
+    s[574..702].copy_from_slice(&ucs2be_string("SACD-AUTHOR ISO9660+JOLIET", 128));
     s[813..830].copy_from_slice(&iso_date(2026, 1, 1));
     s[830..847].copy_from_slice(&iso_date(2026, 1, 1));
     s[864..881].copy_from_slice(&iso_date(2026, 1, 1));

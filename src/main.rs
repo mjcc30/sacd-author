@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sacd_author::{dff, dop, dsf, dsf_write, image, iso_read};
+use sacd_author::{data_iso, dff, dop, dsf, dsf_write, image, iso_read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,14 @@ enum Commands {
         /// Output format: dsf (default) or dff
         #[arg(short = 'f', long, default_value = "dsf")]
         format: String,
+    },
+    /// Build a plain ISO 9660 + Joliet data image from files (FLAC/WAV/...),
+    /// readable by any modern player from DVD-R (e.g. Sony BDP-S490 plays FLAC)
+    DataIso {
+        #[arg(required = true, value_name = "FILES")]
+        inputs: Vec<PathBuf>,
+        #[arg(short, long, default_value = "data.iso")]
+        output: PathBuf,
     },
 }
 
@@ -162,6 +170,38 @@ fn extract(iso: &std::path::Path, output: &std::path::Path, format: &str) -> Res
     Ok(())
 }
 
+fn data_iso_cmd(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
+    let mut entries = Vec::new();
+    for input in inputs {
+        let name = input
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("{}: invalid file name", input.display()))?
+            .to_string();
+        entries.push(data_iso::DataEntry {
+            name,
+            path: input.clone(),
+        });
+    }
+    let volume_id = data_iso::volume_id_from(output);
+    println!(
+        "writing {} ({} file(s)) ...",
+        output.display(),
+        entries.len()
+    );
+    let sectors = data_iso::build_data_iso(&entries, output, &volume_id)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    println!(
+        "done: {} sectors ({:.1} MiB), ISO 9660 + Joliet, files at root",
+        sectors,
+        sectors as f64 * 2048.0 / 1024.0 / 1024.0
+    );
+    for e in &entries {
+        println!("  {}", e.name);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -171,6 +211,7 @@ fn main() -> Result<()> {
             output,
             format,
         }) => extract(&iso, &output, &format),
+        Some(Commands::DataIso { inputs, output }) => data_iso_cmd(&inputs, &output),
         None => {
             if cli.inputs.is_empty() {
                 Cli::parse_from(["sacd-author", "--help"]);
