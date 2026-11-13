@@ -1,27 +1,48 @@
 use anyhow::{Context, Result};
-use clap::Parser;
-use sacd_author::{dsf, image};
+use clap::{Parser, Subcommand};
+use sacd_author::{dsf, dsf_write, image, iso_read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sacd-author",
     version,
-    about = "Convert DSF files into a burnable SACD-R ISO image"
+    about = "Convert DSF files into a burnable SACD-R ISO image, and extract DSF tracks back from an ISO"
 )]
 struct Cli {
-    /// Input DSF files (stereo DSD64), in track order
-    #[arg(required = true, value_name = "DSF_FILES")]
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Legacy form: sacd-author <dsf files...> -o out.iso
+    #[arg(value_name = "DSF_FILES")]
     inputs: Vec<PathBuf>,
 
-    /// Output ISO image path
     #[arg(short, long, default_value = "output.iso")]
     output: PathBuf,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    for input in &cli.inputs {
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Convert DSF files (stereo DSD64) into a SACD-R ISO image
+    Convert {
+        #[arg(required = true, value_name = "DSF_FILES")]
+        inputs: Vec<PathBuf>,
+        #[arg(short, long, default_value = "output.iso")]
+        output: PathBuf,
+    },
+    /// Extract DSF tracks from a SACD-R ISO image
+    Extract {
+        #[arg(value_name = "ISO")]
+        iso: PathBuf,
+        /// Output directory for the .dsf files
+        #[arg(short, long, default_value = "extracted")]
+        output: PathBuf,
+    },
+}
+
+fn convert(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
+    let mut infos = Vec::new();
+    for input in inputs {
         let info =
             dsf::parse(input).with_context(|| format!("failed to parse {}", input.display()))?;
         println!(
@@ -42,15 +63,11 @@ fn main() -> Result<()> {
         if let Some(album) = &info.tags.album {
             println!("  album:  {album}");
         }
+        infos.push(info);
     }
-    let infos: Vec<_> = cli
-        .inputs
-        .iter()
-        .map(|p| dsf::parse(p).with_context(|| format!("failed to parse {}", p.display())))
-        .collect::<Result<_>>()?;
-    println!("writing {} ...", cli.output.display());
-    let summary = image::build_image(&infos, &cli.output)
-        .with_context(|| format!("failed to write {}", cli.output.display()))?;
+    println!("writing {} ...", output.display());
+    let summary = image::build_image(&infos, output)
+        .with_context(|| format!("failed to write {}", output.display()))?;
     println!(
         "done: {} sectors total, {} audio sectors, {} track(s)",
         summary.total_sectors,
@@ -67,4 +84,66 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn extract(iso: &std::path::Path, output: &std::path::Path) -> Result<()> {
+    let img =
+        iso_read::read_iso(iso).with_context(|| format!("failed to read {}", iso.display()))?;
+    std::fs::create_dir_all(output)?;
+    println!(
+        "{}: {} track(s){}",
+        iso.display(),
+        img.tracks.len(),
+        img.album_title
+            .as_ref()
+            .map(|t| format!(", album \"{t}\""))
+            .unwrap_or_default()
+    );
+    for (i, track) in img.tracks.iter().enumerate() {
+        let name = track
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("track{:02}", i + 1));
+        let safe: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = output.join(format!("{:02} {safe}.dsf", i + 1));
+        let samples = track.data.len() as u64 / 2 * 8;
+        dsf_write::write_dsf(
+            &path,
+            &track.data,
+            samples,
+            track.title.as_deref(),
+            track.performer.as_deref(),
+            img.album_title.as_deref(),
+        )?;
+        println!(
+            "  {} ({} bytes, {:.2}s)",
+            path.display(),
+            track.data.len(),
+            samples as f64 / 2_822_400.0
+        );
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Commands::Convert { inputs, output }) => convert(&inputs, &output),
+        Some(Commands::Extract { iso, output }) => extract(&iso, &output),
+        None => {
+            if cli.inputs.is_empty() {
+                Cli::parse_from(["sacd-author", "--help"]);
+            }
+            convert(&cli.inputs, &cli.output)
+        }
+    }
 }
