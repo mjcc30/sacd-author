@@ -14,7 +14,7 @@ sacd-author convert track01.dsf track02.dsf -o album.iso
 sacd-author extract album.iso -o extracted/
 ```
 
-- Inputs: stereo DSD64 DSF files (2.8224 MHz), given in track order.
+- Inputs: stereo DSD64 **DSF or DFF** files (2.8224 MHz), given in track order.
 - Output: hybrid ISO 9660 + UDF 1.02 image, 2048-byte sectors, `SACD/` folder,
   `Master1.TOC` written at LBA 510 (byte offset 0xFF000).
 

@@ -41,6 +41,9 @@ pub struct DsfInfo {
     pub data_offset: u64,
     pub data_size: u64,
     pub tags: Id3Tags,
+    /// DSF stores DSD bytes bit-reversed vs the SACD native order; DFF does
+    /// not. The SACD converter bit-reverses only when this is true.
+    pub bit_reverse_needed: bool,
 }
 
 impl DsfInfo {
@@ -153,6 +156,7 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
         data_offset,
         data_size,
         tags,
+        bit_reverse_needed: true,
     })
 }
 
@@ -247,6 +251,7 @@ pub fn parse(path: &Path) -> Result<DsfInfo> {
         data_offset: data_header_offset + 12,
         data_size,
         tags,
+        bit_reverse_needed: true,
     })
 }
 

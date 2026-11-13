@@ -193,9 +193,10 @@ pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u3
         if nl == 0 && nr == 0 {
             break;
         }
+        let rev = info.bit_reverse_needed;
         for i in 0..DSF_BLOCK_SIZE {
-            pair[2 * i] = l[i].reverse_bits();
-            pair[2 * i + 1] = r[i].reverse_bits();
+            pair[2 * i] = if rev { l[i].reverse_bits() } else { l[i] };
+            pair[2 * i + 1] = if rev { r[i].reverse_bits() } else { r[i] };
         }
         packer.push(&pair)?;
     }

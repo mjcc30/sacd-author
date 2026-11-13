@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sacd_author::{dsf, dsf_write, image, iso_read};
+use sacd_author::{dff, dsf, dsf_write, image, iso_read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -40,11 +40,24 @@ enum Commands {
     },
 }
 
+/// Parse a DSF or DFF input based on extension.
+fn parse_input(path: &std::path::Path) -> sacd_author::Result<sacd_author::dsf::DsfInfo> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "dff" => dff::parse(path),
+        _ => dsf::parse(path),
+    }
+}
+
 fn convert(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
     let mut infos = Vec::new();
     for input in inputs {
         let info =
-            dsf::parse(input).with_context(|| format!("failed to parse {}", input.display()))?;
+            parse_input(input).with_context(|| format!("failed to parse {}", input.display()))?;
         println!(
             "{}: {} Hz, {} ch, {} samples, {:.2}s, {} SACD frames",
             input.display(),
