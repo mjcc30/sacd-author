@@ -4,7 +4,7 @@
 //! scan for SACDTRL1/SACDTRL2), then walk every audio sector parsing
 //! sector/packet/frame headers and verify timecodes + payload round-trip.
 
-use sacd_author::{dsf, image, sacd};
+use sacd_author::{dsf, image, sacd, toc};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -51,14 +51,14 @@ fn iso_plays_back_like_a_sacd_reader() {
     assert_eq!(m[9], 0x14);
     let area1_start = be32(&m, 0x40);
     let area1_size = be16(&m, 0x54);
-    assert_eq!(area1_start, 544);
-    assert_eq!(area1_size, 40);
+    assert_eq!(area1_start, toc::AREA_TOC_1_START); // 540
+    assert_eq!(area1_size, toc::AREA_TOC_SECTORS as u16); // 6
     for i in 1..9u32 {
         assert_eq!(&sec(&mut iso, 510 + i)[0..8], b"SACDText");
     }
     assert_eq!(&sec(&mut iso, 519)[0..8], b"SACD_Man");
 
-    // --- area TOC: scan its 40 sectors for the track lists ---
+    // --- area TOC: scan its sectors for the track lists ---
     let mut trl1 = None;
     let mut trl2 = None;
     for i in 0..area1_size as u32 {

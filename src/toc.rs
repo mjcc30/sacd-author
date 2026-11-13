@@ -81,9 +81,14 @@ pub const START_OF_MASTER_TOC: u32 = 510;
 pub const MASTER_TOC_LEN: u32 = 10;
 pub const MASTER_TOC_2_START: u32 = START_OF_MASTER_TOC + MASTER_TOC_LEN; // 520
 pub const MASTER_TOC_3_START: u32 = MASTER_TOC_2_START + MASTER_TOC_LEN; // 530
-pub const AREA_TOC_1_START: u32 = MASTER_TOC_3_START + MASTER_TOC_LEN + 4; // 544
-pub const AREA_TOC_SECTORS: u16 = 40; // header + SACDTRL1 + SACDTRL2 + text/ISRC/access areas
-pub const AREA_TOC_2_START: u32 = AREA_TOC_1_START + AREA_TOC_SECTORS as u32; // 584
+pub const AREA_TOC_1_START: u32 = MASTER_TOC_3_START + MASTER_TOC_LEN; // 540
+/// Area TOC layout (6 sectors): header, SACDTTxt, SACD_IGL (2 sectors),
+/// SACDTRL1, SACDTRL2. Area TOC-2 is written after the audio area
+/// (Scarlet Book 2.2.6) at AUDIO_START_LBA + audio_sectors.
+pub const AREA_TOC_SECTORS: u16 = 6;
+/// Plain (uncompressed) DSD frame format code in the area TOC header
+/// (low nibble of offset 0x15); 0 would mean DST.
+pub const FRAME_FORMAT_DSD_3IN14: u8 = 2;
 pub const SACD_FRAME_RATE: u32 = 75;
 pub const VERSION_MAJOR: u8 = 1;
 pub const VERSION_MINOR: u8 = 0x14;
@@ -153,7 +158,19 @@ pub struct MasterToc {
 }
 
 impl MasterToc {
-    pub fn new() -> Self {
+    pub fn new(area1_toc1: u32, area1_toc2: u32, area1_size: u16) -> Self {
+        let catalog = |s: &[u8; 16]| *s;
+        let genre = GenreTable {
+            category: 1,
+            reserved: 0,
+            genre: 25,
+        };
+        let mut locales = [LocaleTable {
+            language_code: [0; 2],
+            character_set: 0,
+            reserved: 0,
+        }; 8];
+        locales[0] = LocaleTable::default(); // one text channel: "en", ISO 646
         Self {
             version_major: VERSION_MAJOR,
             version_minor: VERSION_MINOR,
@@ -161,26 +178,34 @@ impl MasterToc {
             album_set_size: 1,
             album_sequence_number: 1,
             reserved02: [0; 4],
-            album_catalog_number: [0; 16],
-            album_genre: [GenreTable::default(); 4],
+            album_catalog_number: catalog(b"SACD-AUTHOR-0001"),
+            album_genre: {
+                let mut g = [GenreTable::default(); 4];
+                g[0] = genre;
+                g
+            },
             reserved03: [0; 8],
-            area_1_toc_1_start: AREA_TOC_1_START,
-            area_1_toc_2_start: AREA_TOC_2_START,
+            area_1_toc_1_start: area1_toc1,
+            area_1_toc_2_start: area1_toc2,
             area_2_toc_1_start: 0,
             area_2_toc_2_start: 0,
             disc_type: DISC_TYPE_HYBRID,
             reserved04: [0; 3],
-            area_1_toc_size: AREA_TOC_SECTORS,
+            area_1_toc_size: area1_size,
             area_2_toc_size: 0,
-            disc_catalog_number: [0; 16],
-            disc_genre: [GenreTable::default(); 4],
+            disc_catalog_number: catalog(b"SACD-AUTHOR-D001"),
+            disc_genre: {
+                let mut g = [GenreTable::default(); 4];
+                g[0] = genre;
+                g
+            },
             disc_date_year: 2026,
             disc_date_month: 1,
             disc_date_day: 1,
             reserved05: [0; 4],
-            text_area_count: 0,
+            text_area_count: 1,
             reserved06: [0; 7],
-            locales: [LocaleTable::default(); 8],
+            locales,
         }
     }
 
@@ -192,14 +217,19 @@ impl MasterToc {
 
 impl Default for MasterToc {
     fn default() -> Self {
-        Self::new()
+        Self::new(
+            AREA_TOC_1_START,
+            AREA_TOC_1_START + AREA_TOC_SECTORS as u32,
+            AREA_TOC_SECTORS,
+        )
     }
 }
 
-/// One `SACDText` sector of the master TOC. Layout: id[8], reserved[8],
-/// 16 x u16 BE text positions (album/disc title, artist, publisher,
-/// copyright + phonetics), then NUL-terminated strings in data[2000].
-/// A position of 0 means "absent".
+/// One `SACDText` sector of the master TOC. Layout (matching commercial
+/// discs): id[8], reserved[8], 16 x u16 BE text positions at 0x10:
+/// album title/artist/publisher/copyright (0x10-0x17), disc ditto
+/// (0x18-0x1F), phonetic ditto (0x20-0x2F); NUL-terminated strings from
+/// 0x40. A position of 0 means "absent".
 pub fn master_sacd_text_sector(
     album_title: Option<&str>,
     album_artist: Option<&str>,
@@ -208,30 +238,24 @@ pub fn master_sacd_text_sector(
 ) -> Vec<u8> {
     let mut s = vec![0u8; SECTOR_SIZE];
     s[0..8].copy_from_slice(b"SACDText");
-    let entries = [
+    let main = [
         album_title,
         album_artist,
-        None,
-        None,
-        None,
-        None,
         None,
         None,
         disc_title,
         disc_artist,
         None,
         None,
-        None,
-        None,
-        None,
-        None,
     ];
-    let mut data_off = 48usize;
+    let mut entries: Vec<Option<&str>> = main.to_vec();
+    entries.extend_from_slice(&main); // phonetic block mirrors the main one
+    let mut data_off = 0x40usize;
     for (i, e) in entries.iter().enumerate() {
         if let Some(txt) = e {
             let bytes = ascii(txt).into_bytes();
             let pos = data_off as u16;
-            s[16 + i * 2..18 + i * 2].copy_from_slice(&pos.to_be_bytes());
+            s[0x10 + i * 2..0x10 + i * 2 + 2].copy_from_slice(&pos.to_be_bytes());
             s[data_off..data_off + bytes.len()].copy_from_slice(&bytes);
             data_off += bytes.len() + 1;
         }
@@ -257,7 +281,15 @@ pub fn master_man_sector() -> Vec<u8> {
 /// (one per locale) + SACD_Man. Readers such as foo_input_sacd require all
 /// three magics to be present.
 pub fn master_toc_area() -> Vec<u8> {
-    master_toc_area_with_text(None, None, None, None)
+    master_toc_area_with_text(
+        None,
+        None,
+        None,
+        None,
+        AREA_TOC_1_START,
+        AREA_TOC_1_START + AREA_TOC_SECTORS as u32,
+        AREA_TOC_SECTORS,
+    )
 }
 
 /// Full 10-sector master TOC area with optional disc-level text.
@@ -266,8 +298,11 @@ pub fn master_toc_area_with_text(
     album_artist: Option<&str>,
     disc_title: Option<&str>,
     disc_artist: Option<&str>,
+    area1_toc1: u32,
+    area1_toc2: u32,
+    area1_size: u16,
 ) -> Vec<u8> {
-    let mut out = MasterToc::new().to_sector();
+    let mut out = MasterToc::new(area1_toc1, area1_toc2, area1_size).to_sector();
     for _ in 0..8 {
         out.extend_from_slice(&master_sacd_text_sector(
             album_title,
@@ -403,9 +438,26 @@ pub struct TrackList2 {
     pub duration: [TrackTime; 255],
 }
 
+/// The `SACD_IGL` structure (2 sectors = 4096 bytes): id[8], then 255 x 12
+/// bytes ISRC (fixed text), 4 reserved bytes at 3068, then 255 x 4 bytes
+/// genre entries at 3072.
+pub fn area_igl_sectors(track_count: usize) -> Vec<u8> {
+    let mut s = vec![0u8; 2 * SECTOR_SIZE];
+    s[0..8].copy_from_slice(b"SACD_IGL");
+    for i in 0..track_count.min(255) {
+        let isrc = format!("XXSAC26{:05}", i + 1); // CCXXXYYNNNNN, 12 chars
+        let b = isrc.as_bytes();
+        s[8 + i * 12..8 + i * 12 + 12].copy_from_slice(b);
+        // genre entry: category 1, reserved, genre 25 (as on commercial discs)
+        s[3072 + i * 4..3072 + i * 4 + 4].copy_from_slice(&[1, 0, 0, 25]);
+    }
+    s
+}
+
 /// Build the stereo area TOC (AREA_TOC_SECTORS sectors) for the given tracks.
-/// `audio_start_lba` is the absolute LBA where the 2C_Audio file starts on disc.
-/// `texts` (optional) are written into a SACDTTxt sector at index 3.
+/// Layout: header (sector 0), SACDTTxt (1), SACD_IGL (2-3), SACDTRL1 (4),
+/// SACDTRL2 (5). `audio_start_lba` is the absolute LBA where the audio area
+/// starts on disc.
 pub fn build_area_toc(
     layouts: &[TrackLayout],
     audio_start_lba: u32,
@@ -417,7 +469,10 @@ pub fn build_area_toc(
         .first()
         .map_or(0, |l| audio_start_lba + l.start_sector);
     let last = layouts.last();
-    let track_end = last.map_or(0, |l| audio_start_lba + l.start_sector + l.sector_count);
+    // last audio LSN is INCLUSIVE (Scarlet Book 3.3)
+    let track_end = last.map_or(0, |l| {
+        audio_start_lba + l.start_sector + l.sector_count.saturating_sub(1)
+    });
 
     let mut trl1 = TrackList1 {
         _magic: (),
@@ -438,14 +493,21 @@ pub fn build_area_toc(
         elapsed += layout.frames;
     }
 
+    let mut languages = [LocaleTable {
+        language_code: [0; 2],
+        character_set: 0,
+        reserved: 0,
+    }; 10];
+    languages[0] = LocaleTable::default(); // one text channel: "en", ISO 646
+
     let header = AreaToc {
         version_major: VERSION_MAJOR,
         version_minor: VERSION_MINOR,
-        size: 40,
+        size: AREA_TOC_SECTORS,
         reserved01: [0; 4],
         max_byte_rate: MAX_BYTE_RATE_DSD64_STEREO,
         sample_frequency: SAMPLE_FREQUENCY_DSD64,
-        frame_format: 0,
+        frame_format: FRAME_FORMAT_DSD_3IN14, // plain DSD (0 would mean DST)
         reserved03: [0; 10],
         channel_count: 2,
         loudspeaker_config: 0,
@@ -464,11 +526,11 @@ pub fn build_area_toc(
         reserved08: [0; 2],
         track_start: first_start,
         track_end,
-        text_area_count: 0,
+        text_area_count: 1,
         reserved09: [0; 7],
-        languages: [LocaleTable::default(); 10],
-        track_text_offset: if texts.is_empty() { 0 } else { 3 },
-        index_list_offset: 0,
+        languages,
+        track_text_offset: if texts.is_empty() { 0 } else { 1 },
+        index_list_offset: 2,
         access_list_offset: 0,
         reserved10: [0; 10],
         area_description_offset: 0,
@@ -479,11 +541,14 @@ pub fn build_area_toc(
     };
 
     let mut out = to_sector_bytes(&header);
-    out.extend_from_slice(&to_sector_bytes(&trl1));
-    out.extend_from_slice(&to_sector_bytes(&trl2));
     if !texts.is_empty() {
         out.extend_from_slice(&area_text_sector(texts));
+    } else {
+        out.extend_from_slice(&vec![0u8; SECTOR_SIZE]);
     }
+    out.extend_from_slice(&area_igl_sectors(layouts.len()));
+    out.extend_from_slice(&to_sector_bytes(&trl1));
+    out.extend_from_slice(&to_sector_bytes(&trl2));
     out.resize(AREA_TOC_SECTORS as usize * SECTOR_SIZE, 0);
     out
 }
@@ -508,17 +573,21 @@ mod tests {
 
     #[test]
     fn master_toc_sector_layout() {
-        let toc = MasterToc::new();
+        let toc = MasterToc::new(540, 556, 6);
         let bytes = toc.to_sector();
         assert_eq!(bytes.len(), SECTOR_SIZE);
         assert_eq!(&bytes[0x00..0x08], b"SACDMTOC");
         assert_eq!(bytes[0x08], 1);
         assert_eq!(bytes[0x09], 0x14);
-        assert_eq!(&bytes[0x40..0x44], &544u32.to_be_bytes());
-        assert_eq!(&bytes[0x44..0x48], &584u32.to_be_bytes());
+        assert_eq!(&bytes[0x40..0x44], &540u32.to_be_bytes());
+        assert_eq!(&bytes[0x44..0x48], &556u32.to_be_bytes());
         assert_eq!(bytes[0x50], DISC_TYPE_HYBRID);
-        assert_eq!(&bytes[0x54..0x56], &40u16.to_be_bytes());
-        assert!(bytes[0xA8..].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[0x54..0x56], &6u16.to_be_bytes());
+        assert_eq!(bytes[0x80], 1); // text_area_count
+        assert_eq!(&bytes[0x88..0x8C], &b"en\x01\x00"[..]); // one locale
+        assert!(bytes[0x8C..].iter().all(|&b| b == 0)); // rest zeroed
+        assert_eq!(&bytes[0x18..0x28], b"SACD-AUTHOR-0001");
+        assert_eq!(&bytes[0x58..0x68], b"SACD-AUTHOR-D001");
     }
 
     #[test]
@@ -531,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn area_toc_three_sectors_with_tracks() {
+    fn area_toc_six_sectors_with_tracks() {
         let layouts = vec![
             TrackLayout {
                 start_sector: 0,
@@ -545,18 +614,28 @@ mod tests {
             },
         ];
         let bytes = build_area_toc(&layouts, 640, &[]);
-        assert_eq!(bytes.len(), 40 * SECTOR_SIZE);
+        assert_eq!(bytes.len(), AREA_TOC_SECTORS as usize * SECTOR_SIZE);
         assert_eq!(&bytes[0x000..0x008], b"TWOCHTOC");
+        assert_eq!(&bytes[0x00A..0x00C], &6u16.to_be_bytes()); // size
         assert_eq!(&bytes[0x010..0x014], &337920u32.to_be_bytes());
         assert_eq!(bytes[0x014], 0x04);
+        assert_eq!(bytes[0x015] & 0x0F, FRAME_FORMAT_DSD_3IN14); // plain DSD, not DST
         assert_eq!(bytes[0x020], 2); // channel_count
         assert_eq!(bytes[0x045], 2); // track_count
-        assert_eq!(&bytes[0x048..0x04C], &640u32.to_be_bytes()); // track_start
-        assert_eq!(&bytes[0x04C..0x050], &940u32.to_be_bytes()); // track_end = 640+100+200
+        assert_eq!(&bytes[0x048..0x04C], &640u32.to_be_bytes()[..]); // track_start
+        assert_eq!(&bytes[0x04C..0x050], &939u32.to_be_bytes()[..]); // track_end inclusive = 640+100+200-1
+        assert_eq!(bytes[0x050], 1); // text_area_count
+        assert_eq!(&bytes[0x58..0x5C], &b"en\x01\x00"[..]); // one locale
+        assert!(bytes[0x5C..0x80].iter().all(|&b| b == 0));
+        assert_eq!(&bytes[0x80..0x82], &0u16.to_be_bytes()); // no track text here
+        assert_eq!(&bytes[0x82..0x84], &2u16.to_be_bytes()); // index list at sector 2
         // total playtime = 225 frames = 3 s
         assert_eq!(&bytes[0x40..0x43], &[0, 3, 0]);
-        // SACDTRL1 at sector 1
-        let off = SECTOR_SIZE;
+        // sector layout: header, (empty TTxt), IGL x2, TRL1, TRL2
+        let off = 2 * SECTOR_SIZE;
+        assert_eq!(&bytes[off..off + 8], b"SACD_IGL");
+        assert_eq!(&bytes[off + 8..off + 20], b"XXSAC2600001");
+        let off = 4 * SECTOR_SIZE;
         assert_eq!(&bytes[off..off + 8], b"SACDTRL1");
         assert_eq!(&bytes[off + 8..off + 12], &640u32.to_be_bytes());
         assert_eq!(&bytes[off + 12..off + 16], &740u32.to_be_bytes());
@@ -564,8 +643,8 @@ mod tests {
             &bytes[off + 8 + 4 * 255..off + 8 + 4 * 255 + 4],
             &100u32.to_be_bytes()
         );
-        // SACDTRL2 at sector 2: start[1] = 75 frames = 0:01:00, duration[1] = 150 = 0:02:00
-        let off = 2 * SECTOR_SIZE;
+        // SACDTRL2 at sector 5: start[1] = 75 frames = 0:01:00, duration[1] = 150 = 0:02:00
+        let off = 5 * SECTOR_SIZE;
         assert_eq!(&bytes[off..off + 8], b"SACDTRL2");
         assert_eq!(&bytes[off + 8 + 4..off + 8 + 8], &[0, 1, 0, 0]);
         assert_eq!(
@@ -576,7 +655,7 @@ mod tests {
 
     #[test]
     fn master_toc_roundtrip() {
-        let toc = MasterToc::new();
+        let toc = MasterToc::new(540, 556, 6);
         let bytes = toc.to_sector();
         let mut cursor = Cursor::new(&bytes);
         let parsed: MasterToc = cursor.read_be().unwrap();

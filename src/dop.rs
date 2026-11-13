@@ -520,18 +520,20 @@ mod tests {
 
         let iso_a = tempfile::NamedTempFile::new().unwrap();
         let iso_b = tempfile::NamedTempFile::new().unwrap();
-        crate::image::build_image(&[dsf_info], iso_a.path()).unwrap();
-        crate::image::build_image(&[dop_info], iso_b.path()).unwrap();
+        let sum_a = crate::image::build_image(&[dsf_info], iso_a.path()).unwrap();
+        let sum_b = crate::image::build_image(&[dop_info], iso_b.path()).unwrap();
+        assert_eq!(sum_a.audio_sectors, sum_b.audio_sectors);
 
         let audio_offset = crate::image::AUDIO_START_LBA as u64 * 2048;
-        let mut a = Vec::new();
+        let audio_len = sum_a.audio_sectors as u64 * 2048;
+        let mut a = vec![0u8; audio_len as usize];
         let mut fa = std::fs::File::open(iso_a.path()).unwrap();
         fa.seek(SeekFrom::Start(audio_offset)).unwrap();
-        fa.read_to_end(&mut a).unwrap();
-        let mut b = Vec::new();
+        fa.read_exact(&mut a).unwrap();
+        let mut b = vec![0u8; audio_len as usize];
         let mut fb = std::fs::File::open(iso_b.path()).unwrap();
         fb.seek(SeekFrom::Start(audio_offset)).unwrap();
-        fb.read_to_end(&mut b).unwrap();
+        fb.read_exact(&mut b).unwrap();
         assert_eq!(a, b, "2C_Audio area differs between DSF and DoP inputs");
     }
 }

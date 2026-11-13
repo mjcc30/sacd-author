@@ -22,10 +22,9 @@
 //! - 510..520  Master1.TOC (raw, first sector = SACDMTOC)  <- LBA 510 = 0xFF000
 //! - 520..530  Master2.TOC
 //! - 530..540  Master3.TOC
-//! - 540..543  Area TOC copy 1 (TWOCHTOC + SACDTRL1 + SACDTRL2)
-//! - 543..546  Area TOC copy 2
-//! - 546..640  zeros
-//! - 640..     2C_Audio (converted DSD sectors)
+//! - 540..546  Area TOC copy 1 (TWOCHTOC + SACDTTxt + SACD_IGL x2 + SACDTRL1 + SACDTRL2)
+//! - 546..     2C_Audio (converted DSD sectors)
+//! - end       Area TOC copy 2 (after the audio, Scarlet Book 2.2.6)
 
 use crate::dsf::DsfInfo;
 use crate::iso9660 as iso;
@@ -54,7 +53,7 @@ pub const UDF_MASTER3_FE_LBA: u32 = 266;
 pub const UDF_AUDIO_FE_LBA: u32 = 267;
 pub const UDF_ROOT_FIDS_LBA: u32 = 268;
 pub const UDF_SACD_FIDS_LBA: u32 = 269;
-pub const AUDIO_START_LBA: u32 = 624;
+pub const AUDIO_START_LBA: u32 = toc::AREA_TOC_1_START + toc::AREA_TOC_SECTORS as u32; // 546
 
 pub struct ImageSummary {
     pub total_sectors: u32,
@@ -72,7 +71,8 @@ fn write_sector(file: &mut File, lba: u32, data: &[u8]) -> std::io::Result<()> {
 pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageSummary> {
     let layouts = sacd::track_layouts(infos);
     let audio_sectors: u32 = layouts.iter().map(|l| l.sector_count).sum();
-    let total_sectors = AUDIO_START_LBA + audio_sectors;
+    let area_toc_2_start = AUDIO_START_LBA + audio_sectors;
+    let total_sectors = area_toc_2_start + toc::AREA_TOC_SECTORS as u32;
 
     let mut file = File::create(out_path)?;
     file.set_len(total_sectors as u64 * SECTOR as u64)?;
@@ -324,6 +324,9 @@ pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageS
         album_artist.as_deref(),
         album_title.as_deref(),
         album_artist.as_deref(),
+        toc::AREA_TOC_1_START,
+        area_toc_2_start,
+        toc::AREA_TOC_SECTORS,
     );
     for base in [
         toc::START_OF_MASTER_TOC,
@@ -349,7 +352,7 @@ pub fn build_image(infos: &[DsfInfo], out_path: &Path) -> std::io::Result<ImageS
     let area_toc = toc::build_area_toc(&layouts, AUDIO_START_LBA, &texts);
     for (i, chunk) in area_toc.chunks(SECTOR).enumerate() {
         write_sector(&mut file, toc::AREA_TOC_1_START + i as u32, chunk)?;
-        write_sector(&mut file, toc::AREA_TOC_2_START + i as u32, chunk)?;
+        write_sector(&mut file, area_toc_2_start + i as u32, chunk)?;
     }
 
     // --- 2C_Audio: stream the converted DSD sectors at AUDIO_START_LBA ---
@@ -400,7 +403,10 @@ mod tests {
     fn image_has_sacd_signature_at_lba_510() {
         let (_d, iso, summary) = build_test_image(32768); // 1 frame = 5 sectors
         assert_eq!(summary.audio_sectors, 5);
-        assert_eq!(summary.total_sectors, AUDIO_START_LBA + 5);
+        assert_eq!(
+            summary.total_sectors,
+            AUDIO_START_LBA + 5 + toc::AREA_TOC_SECTORS as u32
+        );
         assert_eq!(
             std::fs::metadata(iso.path()).unwrap().len(),
             summary.total_sectors as u64 * SECTOR as u64
@@ -409,7 +415,8 @@ mod tests {
         let at_510 = read_at(iso.path(), 510, 8);
         assert_eq!(&at_510, b"SACDMTOC");
         let sector = read_at(iso.path(), 510, SECTOR);
-        assert_eq!(&sector[0x40..0x44], &544u32.to_be_bytes());
+        assert_eq!(&sector[0x40..0x44], &toc::AREA_TOC_1_START.to_be_bytes());
+        assert_eq!(&sector[0x44..0x48], &(AUDIO_START_LBA + 5).to_be_bytes()); // TOC-2 after audio
         assert_eq!(read_at(iso.path(), 511, 8), b"SACDText");
         assert_eq!(read_at(iso.path(), 519, 8), b"SACD_Man");
     }
@@ -422,12 +429,19 @@ mod tests {
         assert_eq!(&pvd[1..6], b"CD001");
         let anchor = read_at(iso.path(), 256, 2);
         assert_eq!(&anchor, &2u16.to_le_bytes());
-        let area = read_at(iso.path(), 544, 8);
+        let area = read_at(iso.path(), toc::AREA_TOC_1_START, 8);
         assert_eq!(&area, b"TWOCHTOC");
-        let trl1 = read_at(iso.path(), 545, 8);
+        let ttxt = read_at(iso.path(), toc::AREA_TOC_1_START + 1, 8);
+        assert_eq!(&ttxt, b"SACDTTxt");
+        let igl = read_at(iso.path(), toc::AREA_TOC_1_START + 2, 8);
+        assert_eq!(&igl, b"SACD_IGL");
+        let trl1 = read_at(iso.path(), toc::AREA_TOC_1_START + 4, 8);
         assert_eq!(&trl1, b"SACDTRL1");
-        let trl2 = read_at(iso.path(), 546, 8);
+        let trl2 = read_at(iso.path(), toc::AREA_TOC_1_START + 5, 8);
         assert_eq!(&trl2, b"SACDTRL2");
+        // area TOC copy 2 right after the audio
+        let toc2 = read_at(iso.path(), AUDIO_START_LBA + 5, 8);
+        assert_eq!(&toc2, b"TWOCHTOC");
         // UDF tag checksums valid on VDS sectors
         for lba in 256..=260 {
             let s = read_at(iso.path(), lba, SECTOR);
