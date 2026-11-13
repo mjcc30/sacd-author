@@ -107,6 +107,7 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
         data_size,
         tags,
         bit_reverse_needed: false,
+        packing: crate::dsf::AudioPacking::Blocks,
     })
 }
 

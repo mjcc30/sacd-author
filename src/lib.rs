@@ -1,4 +1,5 @@
 pub mod dff;
+pub mod dop;
 pub mod dsf;
 pub mod dsf_write;
 pub mod error;

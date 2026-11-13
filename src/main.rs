@@ -1,20 +1,20 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sacd_author::{dff, dsf, dsf_write, image, iso_read};
+use sacd_author::{dff, dop, dsf, dsf_write, image, iso_read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sacd-author",
     version,
-    about = "Convert DSF files into a burnable SACD-R ISO image, and extract DSF tracks back from an ISO"
+    about = "Convert DSF/DFF/DoP-WAV files into a burnable SACD-R ISO image, and extract DSF/DFF tracks back from an ISO"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Legacy form: sacd-author <dsf files...> -o out.iso
-    #[arg(value_name = "DSF_FILES")]
+    /// Legacy form: sacd-author <input files...> -o out.iso
+    #[arg(value_name = "FILES")]
     inputs: Vec<PathBuf>,
 
     #[arg(short, long, default_value = "output.iso")]
@@ -23,9 +23,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Convert DSF files (stereo DSD64) into a SACD-R ISO image
+    /// Convert DSF/DFF/DoP-WAV files (stereo DSD64) into a SACD-R ISO image
     Convert {
-        #[arg(required = true, value_name = "DSF_FILES")]
+        #[arg(required = true, value_name = "FILES")]
         inputs: Vec<PathBuf>,
         #[arg(short, long, default_value = "output.iso")]
         output: PathBuf,
@@ -43,7 +43,7 @@ enum Commands {
     },
 }
 
-/// Parse a DSF or DFF input based on extension.
+/// Parse a DSF, DFF or DoP-WAV input based on extension.
 fn parse_input(path: &std::path::Path) -> sacd_author::Result<sacd_author::dsf::DsfInfo> {
     let ext = path
         .extension()
@@ -52,6 +52,7 @@ fn parse_input(path: &std::path::Path) -> sacd_author::Result<sacd_author::dsf::
         .to_ascii_lowercase();
     match ext.as_str() {
         "dff" => dff::parse(path),
+        "wav" => dop::parse(path),
         _ => dsf::parse(path),
     }
 }

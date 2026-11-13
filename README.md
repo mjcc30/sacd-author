@@ -5,18 +5,26 @@ Open-source Rust SACD authoring tool to convert DSF files into burnable SACD-R I
 
 ## Supported formats
 
-Input/output audio is **native DSD64 only**: DSF and DFF (both accepted as
-input by extension; `extract` writes DSF by default, DFF with `-f dff`).
-PCM formats (FLAC, WAV, WavPack, ...) are intentionally not supported: a
-SACD-R needs 1-bit DSD, and PCM->DSD requires a lossy sigma-delta
-modulation that is out of scope. Convert PCM to DSF first with an external
-tool (sox/JRiver/dsd tools), then use sacd-author.
+Input audio is **native DSD64 only**, in any of these containers (chosen by
+file extension):
+
+- `.dsf` — Sony DSF (bit-reversed DSD bytes, ID3v2 tags at the end)
+- `.dff` — Philips DSDIFF (native SACD bit order, optional `ID3 ` chunk)
+- `.wav` — **WAV-DSD / DoP** (DSD over PCM, DoP Open Standard v1.1: 24-bit
+  IEEE-float carrier at 176.4 kHz, marker bytes 0x05/0xFA; RIFF `LIST/INFO`
+  INAM/IART/IPRD and `id3 ` chunks are read as tags)
+
+`extract` writes DSF by default, DFF with `-f dff`.
+Plain PCM formats (FLAC, PCM WAV, WavPack, ...) are intentionally not
+supported: a SACD-R needs 1-bit DSD, and PCM->DSD requires a lossy
+sigma-delta modulation that is out of scope. Convert PCM to DSF first with
+an external tool (sox/JRiver/dsd tools), then use sacd-author.
 
 ## Usage
 
 ```bash
-# DSF -> SACD-R ISO (legacy form still works)
-sacd-author track01.dsf track02.dsf ... -o album.iso
+# DSF/DFF/DoP-WAV -> SACD-R ISO (legacy form still works)
+sacd-author track01.dsf track02.dff track03.wav ... -o album.iso
 sacd-author convert track01.dsf track02.dsf -o album.iso
 
 # SACD-R ISO -> DSF or DFF tracks (for non-SACD players / archiving)
@@ -24,15 +32,18 @@ sacd-author extract album.iso -o extracted/              # DSF (default)
 sacd-author extract album.iso -o extracted_dff/ -f dff    # DFF
 ```
 
-- Inputs: stereo DSD64 **DSF or DFF** files (2.8224 MHz), given in track order.
+- Inputs: stereo DSD64 (2.8224 MHz) **DSF, DFF or DoP-WAV** files, given in track order.
 - Output: hybrid ISO 9660 + UDF 1.02 image, 2048-byte sectors, `SACD/` folder,
   `Master1.TOC` written at LBA 510 (byte offset 0xFF000).
 
 ## Pipeline
 
-1. `dsf` — parse DSF headers, `fmt `/`data` chunks, ID3v2 tags (TIT2/TPE1/TALB)
-2. `sacd` — convert interleaved 4096-byte DSF block pairs to byte-interleaved
-   2048-byte SACD sectors (1 pair = 4 sectors), zero-pad the last block
+1. `dsf`/`dff`/`dop` — parse DSF headers + ID3v2, DFF chunks, or DoP WAV
+   (RIFF chunks, 0x05/0xFA markers, LIST/INFO tags); all yield the same
+   track representation
+2. `sacd` — convert the DSD stream (4096-byte block pairs, or DoP 24-bit
+   frames unpacked to the same layout) to byte-interleaved 2048-byte SACD
+   sectors, zero-pad the last block
 3. `toc` — big-endian Scarlet Book structures (`SACDMTOC`, `TWOCHTOC`,
    `SACDTRL1/2`) with LBA and 75 fps timecodes
 4. `iso9660` / `udf` / `image` — assemble the hybrid filesystem image and the

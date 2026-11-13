@@ -31,6 +31,16 @@ use std::path::{Path, PathBuf};
 pub const DSD64_SAMPLE_RATE: u32 = 2_822_400;
 pub const BLOCK_SIZE: u32 = 4096;
 
+/// How the raw DSD stream is packed inside the input file's data area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPacking {
+    /// DSF/DFF: interleaved 4096-byte blocks per channel ([L blk][R blk]...).
+    Blocks,
+    /// DoP (WAV-DSD): 24-bit PCM frames, 3 bytes per channel per sample
+    /// ([dsd_lo, dsd_hi, marker]), channels interleaved per frame.
+    Dop,
+}
+
 #[derive(Debug, Clone)]
 pub struct DsfInfo {
     pub path: PathBuf,
@@ -39,11 +49,15 @@ pub struct DsfInfo {
     pub samples_per_channel: u64,
     pub block_size: u32,
     pub data_offset: u64,
+    /// For `AudioPacking::Blocks`: bytes of the data chunk.
+    /// For `AudioPacking::Dop`: virtual size of the unpacked stream, rounded
+    /// up to whole 8192-byte block pairs (what `sacd::stream_frames` needs).
     pub data_size: u64,
     pub tags: Id3Tags,
-    /// DSF stores DSD bytes bit-reversed vs the SACD native order; DFF does
-    /// not. The SACD converter bit-reverses only when this is true.
+    /// DSF and DoP store DSD bytes bit-reversed vs the SACD native order; DFF
+    /// does not. The SACD converter bit-reverses only when this is true.
     pub bit_reverse_needed: bool,
+    pub packing: AudioPacking,
 }
 
 impl DsfInfo {
@@ -157,6 +171,7 @@ pub fn parse_bytes(data: &[u8], path: &Path) -> Result<DsfInfo> {
         data_size,
         tags,
         bit_reverse_needed: true,
+        packing: AudioPacking::Blocks,
     })
 }
 
@@ -252,6 +267,7 @@ pub fn parse(path: &Path) -> Result<DsfInfo> {
         data_size,
         tags,
         bit_reverse_needed: true,
+        packing: AudioPacking::Blocks,
     })
 }
 

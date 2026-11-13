@@ -36,6 +36,9 @@ pub enum SacdError {
 
     #[error("{path}: ID3 parse error: {msg}")]
     Id3 { path: PathBuf, msg: String },
+
+    #[error("{path}: not a DoP (DSD-over-PCM) WAV file: {msg}")]
+    NotDop { path: PathBuf, msg: String },
 }
 
 pub type Result<T> = std::result::Result<T, SacdError>;

@@ -23,7 +23,8 @@
 //! sacd-ripper's bit_reverse_table in dsf.c), so every payload byte is
 //! bit-reversed during conversion.
 
-use crate::dsf::DsfInfo;
+use crate::dop::{DOP_GROUP_BYTES, SAMPLES_PER_BLOCK_PAIR};
+use crate::dsf::{AudioPacking, DsfInfo};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -165,9 +166,54 @@ fn read_padded(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize>
     Ok(read)
 }
 
-/// Convert one DSF `data` chunk into packed SACD sectors appended to `out`.
+/// Convert one DoP (WAV-DSD) `data` chunk into packed SACD sectors appended to
+/// `out`. Each DOP_GROUP_BYTES (12288) payload bytes unpack to one 8192-byte
+/// block pair: per sample frame [L lo, L hi, L mk, R lo, R hi, R mk], the
+/// marker bytes (0x05/0xFA) are dropped and the 4 DSD bytes are byte-
+/// interleaved as L0 R0 L1 R1 ... (oldest DSD byte first).
+fn convert_track_dop(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u32> {
+    let path = info.path.clone();
+    let mut file = File::open(&path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+    file.seek(SeekFrom::Start(info.data_offset))?;
+    let mut reader = BufReader::with_capacity(DOP_GROUP_BYTES, &mut file);
+    let writer = BufWriter::with_capacity(SECTORS_PER_FRAME as usize * SECTOR_SIZE, out);
+    let mut packer = FramePacker::new(writer);
+
+    let mut pair = [0u8; SECTOR_PAIR_BYTES];
+    let rev = info.bit_reverse_needed;
+    let groups = info.data_size / SECTOR_PAIR_BYTES as u64;
+    for _ in 0..groups {
+        let mut chunk = [0u8; DOP_GROUP_BYTES];
+        let n = read_padded(&mut reader, &mut chunk)?;
+        let samples = (n / 6).min(SAMPLES_PER_BLOCK_PAIR);
+        for s in 0..samples {
+            let b = &chunk[s * 6..s * 6 + 6];
+            if !(b[2] == 0x05 || b[2] == 0xFA) || !(b[5] == 0x05 || b[5] == 0xFA) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: bad DoP marker at sample {s}", path.display()),
+                ));
+            }
+            pair[4 * s] = if rev { b[0].reverse_bits() } else { b[0] };
+            pair[4 * s + 1] = if rev { b[3].reverse_bits() } else { b[3] };
+            pair[4 * s + 2] = if rev { b[1].reverse_bits() } else { b[1] };
+            pair[4 * s + 3] = if rev { b[4].reverse_bits() } else { b[4] };
+        }
+        // zero-pad the last partial group, like DSF blocks
+        pair.iter_mut().skip(samples * 4).for_each(|b| *b = 0);
+        packer.push(&pair)?;
+    }
+    packer.finish()
+}
+
+/// Convert one input track (DSF/DFF `data` chunk, or DoP WAV payload) into
+/// packed SACD sectors appended to `out`.
 /// Returns the number of 2048-byte sectors written.
 pub fn convert_track(info: &DsfInfo, out: &mut impl Write) -> std::io::Result<u32> {
+    if info.packing == AudioPacking::Dop {
+        return convert_track_dop(info, out);
+    }
     let path = info.path.clone();
     let mut file = File::open(&path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
