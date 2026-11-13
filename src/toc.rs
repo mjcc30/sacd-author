@@ -226,9 +226,10 @@ impl Default for MasterToc {
 }
 
 /// One `SACDText` sector of the master TOC. Layout (matching commercial
-/// discs): id[8], reserved[8], 16 x u16 BE text positions at 0x10:
-/// album title/artist/publisher/copyright (0x10-0x17), disc ditto
-/// (0x18-0x1F), phonetic ditto (0x20-0x2F); NUL-terminated strings from
+/// discs): id[8], reserved[8], 16 x u16 BE text positions at 0x10, in the
+/// order of spec 2.5.4: album title/artist/publisher/copyright (0x10-0x17),
+/// album phonetic ditto (0x18-0x1F), disc title/artist/publisher/copyright
+/// (0x20-0x27), disc phonetic ditto (0x28-0x2F); NUL-terminated strings from
 /// 0x40. A position of 0 means "absent".
 pub fn master_sacd_text_sector(
     album_title: Option<&str>,
@@ -238,22 +239,28 @@ pub fn master_sacd_text_sector(
 ) -> Vec<u8> {
     let mut s = vec![0u8; SECTOR_SIZE];
     s[0..8].copy_from_slice(b"SACDText");
-    let main = [
+    let entries: [Option<&str>; 16] = [
         album_title,
         album_artist,
+        None,
+        None,
+        None,
+        None,
         None,
         None,
         disc_title,
         disc_artist,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
     ];
-    let mut entries: Vec<Option<&str>> = main.to_vec();
-    entries.extend_from_slice(&main); // phonetic block mirrors the main one
     let mut data_off = 0x40usize;
     for (i, e) in entries.iter().enumerate() {
         if let Some(txt) = e {
-            let bytes = ascii(txt).into_bytes();
+            let bytes = latin1(txt);
             let pos = data_off as u16;
             s[0x10 + i * 2..0x10 + i * 2 + 2].copy_from_slice(&pos.to_be_bytes());
             s[data_off..data_off + bytes.len()].copy_from_slice(&bytes);
@@ -263,10 +270,21 @@ pub fn master_sacd_text_sector(
     s
 }
 
-/// Lossy ASCII for SACDText (character_set 1 = ISO 646).
-fn ascii(s: &str) -> String {
+/// Lossy Latin-1 encoding for SACDText (character_set 1 = ISO 646; per spec
+/// 2.6.2 bytes 0x80-0xFF still decode as ISO 8859-1, so accents survive).
+/// Control characters become spaces, anything above U+00FF becomes '?'.
+fn latin1(s: &str) -> Vec<u8> {
     s.chars()
-        .map(|c| if c.is_ascii() { c } else { '?' })
+        .map(|c| {
+            let cp = c as u32;
+            if cp < 0x20 {
+                b' '
+            } else if cp <= 0xFF {
+                cp as u8
+            } else {
+                b'?'
+            }
+        })
         .collect()
 }
 
@@ -338,7 +356,7 @@ pub fn area_text_sector(tracks: &[TrackText]) -> Vec<u8> {
         s[off] = entries.len() as u8;
         off += 4;
         for (ttype, txt) in entries {
-            let bytes = ascii(txt).into_bytes();
+            let bytes = latin1(txt);
             if off + 2 + bytes.len() + 1 > SECTOR_SIZE {
                 break;
             }
@@ -675,12 +693,25 @@ mod tests {
 
     #[test]
     fn sacd_text_sectors_carry_titles() {
-        let m = master_sacd_text_sector(Some("My Album"), Some("An Artist"), None, None);
+        let m = master_sacd_text_sector(
+            Some("My Album"),
+            Some("An Artist"),
+            Some("My Disc"),
+            Some("A Disc Artist"),
+        );
         assert_eq!(&m[0..8], b"SACDText");
-        let title_pos = u16::from_be_bytes([m[16], m[17]]) as usize;
-        let artist_pos = u16::from_be_bytes([m[18], m[19]]) as usize;
+        // album title/artist at 0x10/0x12, disc title/artist at 0x20/0x22
+        // (spec 2.5.4), phonetic slots left empty
+        let title_pos = u16::from_be_bytes([m[0x10], m[0x11]]) as usize;
+        let artist_pos = u16::from_be_bytes([m[0x12], m[0x13]]) as usize;
+        let disc_pos = u16::from_be_bytes([m[0x20], m[0x21]]) as usize;
+        let disc_artist_pos = u16::from_be_bytes([m[0x22], m[0x23]]) as usize;
         assert_eq!(&m[title_pos..title_pos + 8], b"My Album");
         assert_eq!(&m[artist_pos..artist_pos + 9], b"An Artist");
+        assert_eq!(&m[disc_pos..disc_pos + 7], b"My Disc");
+        assert_eq!(&m[disc_artist_pos..disc_artist_pos + 13], b"A Disc Artist");
+        assert_eq!(&m[0x14..0x20], &[0u8; 12]); // album publisher/copyright + phonetic
+        assert_eq!(&m[0x24..0x30], &[0u8; 12]); // disc publisher/copyright + phonetic
 
         let texts = vec![
             TrackText {
@@ -701,5 +732,22 @@ mod tests {
         assert_eq!(&a[p0 + 6..p0 + 11], b"Song ");
         assert!(p1 > p0);
         assert_eq!(a[p1 + 4], 0x01);
+    }
+
+    #[test]
+    fn sacd_text_uses_latin1_for_accents() {
+        // character_set 1 still decodes bytes 0x80-0xFF as ISO 8859-1 (spec
+        // 2.6.2), so "Década" is stored as Latin-1, not "D?cada"
+        let m = master_sacd_text_sector(Some("Década"), None, None, None);
+        let title_pos = u16::from_be_bytes([m[0x10], m[0x11]]) as usize;
+        assert_eq!(&m[title_pos..title_pos + 6], b"D\xe9cada");
+
+        let texts = vec![TrackText {
+            title: "Una Sensación".into(),
+            performer: String::new(),
+        }];
+        let a = area_text_sector(&texts);
+        let p0 = u16::from_be_bytes([a[8], a[9]]) as usize;
+        assert_eq!(&a[p0 + 6..p0 + 6 + 13], b"Una Sensaci\xf3n");
     }
 }

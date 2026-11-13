@@ -70,6 +70,12 @@ fn sec(f: &mut File, lba: u32) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Decode a SACDText string: locale character_set 1 decodes bytes 0x80-0xFF
+/// as ISO 8859-1 (spec 2.6.2), so each byte maps to U+00XX.
+fn latin1_str(b: &[u8]) -> String {
+    b.iter().map(|&c| c as char).collect()
+}
+
 fn cstr(b: &[u8], off: usize) -> Option<String> {
     if off == 0 || off >= b.len() {
         return None;
@@ -79,7 +85,7 @@ fn cstr(b: &[u8], off: usize) -> Option<String> {
         .position(|&c| c == 0)
         .map(|e| off + e)
         .unwrap_or(b.len());
-    let s = String::from_utf8_lossy(&b[off..end]).into_owned();
+    let s = latin1_str(&b[off..end]);
     if s.is_empty() { None } else { Some(s) }
 }
 
@@ -204,7 +210,7 @@ fn read_track_text(ttxt: Option<&[u8]>, idx: usize) -> (Option<String>, Option<S
             .position(|&c| c == 0)
             .map(|e| p + e)
             .unwrap_or(t.len());
-        let s = String::from_utf8_lossy(&t[p..end]).into_owned();
+        let s = latin1_str(&t[p..end]);
         match ttype {
             0x01 => title = Some(s),
             0x02 => performer = Some(s),
