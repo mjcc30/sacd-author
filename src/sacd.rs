@@ -152,7 +152,7 @@ impl<W: Write> FramePacker<W> {
 }
 
 /// Read up to `buf.len()` bytes; zero-pads the remainder. Returns bytes read.
-fn read_padded(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+pub(crate) fn read_padded(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut read = 0;
     while read < buf.len() {
         match reader.read(&mut buf[read..])? {

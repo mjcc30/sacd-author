@@ -1,0 +1,766 @@
+//! `dsd2pcm`: convert DSD (DSF / DFF / DoP-WAV file, or a SACD-R ISO) to linear
+//! PCM and write WAV, FLAC or WavPack.
+//!
+//! DSP chain: the 1-bit DSD stream (expanded to +/-1.0 samples in the correct
+//! bit order: MSB-first for SACD/DFF native, LSB-first for DSF/DoP) goes through
+//! a two-stage polyphase Kaiser FIR low-pass (see `resample`), because the DSD
+//! noise shaper dumps huge ultrasonic noise above ~20-30 kHz that must be
+//! filtered out before decimation. Stage 1 decimates to fs_d/2^k >= target
+//! rate; stage 2 does the rational resample to the exact target rate.
+//! A gain (default +6 dB, since DSD full scale sits ~6 dB below PCM 0 dBFS)
+//! is applied and the result is clamped to full scale.
+
+use crate::dop::{DOP_GROUP_BYTES, SAMPLES_PER_BLOCK_PAIR};
+use crate::dsf::{AudioPacking, DsfInfo};
+use crate::error::{Result, SacdError};
+use crate::iso_read::{self, IsoTrack};
+use crate::resample::{Polyphase, expand_bits};
+use crate::sacd::SECTOR_PAIR_BYTES;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// DSD64 rate handled by all our parsers.
+pub const DSD64: u32 = 2_822_400;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PcmParams {
+    /// Target PCM sample rate (44100/48000/88200/96000/176400/192000/...).
+    pub rate: u32,
+    /// Output bit depth: 16 or 24.
+    pub bits: u8,
+    /// Low-pass cutoff in Hz (default: min(50000, 0.45*rate)).
+    pub lowpass: Option<f64>,
+    /// Gain in dB applied after filtering (default +6 dB).
+    pub gain_db: f64,
+}
+
+impl Default for PcmParams {
+    fn default() -> Self {
+        PcmParams {
+            rate: 96_000,
+            bits: 24,
+            lowpass: None,
+            gain_db: 6.0,
+        }
+    }
+}
+
+pub fn supported_rate(rate: u32) -> bool {
+    matches!(
+        rate,
+        44_100 | 48_000 | 88_200 | 96_000 | 176_400 | 192_000 | 352_800 | 384_000
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PcmFormat {
+    Wav,
+    Flac,
+    Wv,
+}
+
+impl PcmFormat {
+    pub fn from_ext(ext: &str) -> Option<PcmFormat> {
+        match ext.to_ascii_lowercase().as_str() {
+            "wav" => Some(PcmFormat::Wav),
+            "flac" => Some(PcmFormat::Flac),
+            "wv" => Some(PcmFormat::Wv),
+            _ => None,
+        }
+    }
+
+    pub fn ext(self) -> &'static str {
+        match self {
+            PcmFormat::Wav => "wav",
+            PcmFormat::Flac => "flac",
+            PcmFormat::Wv => "wv",
+        }
+    }
+}
+
+/// Streaming DSD reader: yields 8192-byte byte-interleaved (L0 R0 L1 R1 ...)
+/// blocks in the file's native bit order (bit order is handled later, at bit
+/// expansion time).
+struct DsdBlockReader {
+    file: File,
+    remaining_raw: u64,
+    dop: bool,
+    eof: bool,
+}
+
+impl DsdBlockReader {
+    fn open(info: &DsfInfo) -> std::io::Result<Self> {
+        let mut file = File::open(&info.path)?;
+        file.seek(SeekFrom::Start(info.data_offset))?;
+        let remaining_raw = if info.packing == AudioPacking::Dop {
+            info.data_size / SECTOR_PAIR_BYTES as u64 * DOP_GROUP_BYTES as u64
+        } else {
+            info.data_size
+        };
+        Ok(Self {
+            file,
+            remaining_raw,
+            dop: info.packing == AudioPacking::Dop,
+            eof: false,
+        })
+    }
+
+    fn read_padded(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut read = 0;
+        while read < buf.len() {
+            match self.file.read(&mut buf[read..])? {
+                0 => break,
+                n => read += n,
+            }
+        }
+        for b in &mut buf[read..] {
+            *b = 0;
+        }
+        self.remaining_raw = self.remaining_raw.saturating_sub(read as u64);
+        Ok(read)
+    }
+
+    fn next_block(&mut self) -> std::io::Result<Option<[u8; SECTOR_PAIR_BYTES]>> {
+        if self.eof || self.remaining_raw == 0 {
+            return Ok(None);
+        }
+        let mut pair = [0u8; SECTOR_PAIR_BYTES];
+        if self.dop {
+            let mut chunk = [0u8; DOP_GROUP_BYTES];
+            let n = self.read_padded(&mut chunk)?;
+            if n == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            let samples = (n / 6).min(SAMPLES_PER_BLOCK_PAIR);
+            for s in 0..samples {
+                let b = &chunk[s * 6..s * 6 + 6];
+                pair[4 * s] = b[0];
+                pair[4 * s + 1] = b[3];
+                pair[4 * s + 2] = b[1];
+                pair[4 * s + 3] = b[4];
+            }
+        } else {
+            let mut l = [0u8; 4096];
+            let mut r = [0u8; 4096];
+            let nl = self.read_padded(&mut l[..4096.min(self.remaining_raw as usize)])?;
+            let nr = self.read_padded(&mut r[..4096.min(self.remaining_raw as usize)])?;
+            if nl == 0 && nr == 0 {
+                self.eof = true;
+                return Ok(None);
+            }
+            for i in 0..4096 {
+                pair[2 * i] = l[i];
+                pair[2 * i + 1] = r[i];
+            }
+        }
+        Ok(Some(pair))
+    }
+}
+
+/// Convert a stream of 8192-byte interleaved DSD blocks to interleaved i32
+/// PCM (full-scale i32; shift right for 24/16-bit output), calling `sink`
+/// with chunks. Returns the number of output frames.
+pub fn convert_blocks(
+    mut next_block: impl FnMut() -> std::io::Result<Option<[u8; SECTOR_PAIR_BYTES]>>,
+    msb_first: bool,
+    dsd_rate: u32,
+    params: &PcmParams,
+    mut sink: impl FnMut(&[i32]),
+) -> std::io::Result<u64> {
+    let fs_d = dsd_rate as u64;
+    let rate = params.rate as u64;
+    // stage 1: smallest power-of-two decimation keeping fs_mid >= rate
+    let mut k = 0u32;
+    while (fs_d >> (k + 1)) >= rate && (fs_d >> (k + 1)).is_multiple_of(2) {
+        k += 1;
+    }
+    let fs_mid = fs_d >> k;
+    let mut r1_l = Polyphase::new(
+        fs_d,
+        fs_mid,
+        0.45 * fs_mid as f64,
+        fs_mid as f64 / 2.0,
+        100.0,
+    );
+    let mut r1_r = Polyphase::new(
+        fs_d,
+        fs_mid,
+        0.45 * fs_mid as f64,
+        fs_mid as f64 / 2.0,
+        100.0,
+    );
+    let fc = params.lowpass.unwrap_or(50_000.0).min(0.45 * rate as f64);
+    let use_stage2 = fs_mid != rate;
+    let mut r2_l = use_stage2.then(|| Polyphase::new(fs_mid, rate, fc, rate as f64 / 2.0, 100.0));
+    let mut r2_r = use_stage2.then(|| Polyphase::new(fs_mid, rate, fc, rate as f64 / 2.0, 100.0));
+
+    let gain = 10f64.powf(params.gain_db / 20.0);
+    let to_i32 = |y: f64| -> i32 {
+        let v = (y * gain).clamp(-1.0, 1.0);
+        (v * 2_147_483_647.0).round() as i64 as i32
+    };
+
+    let mut frames_out = 0u64;
+    let process = |mid_l: &[f64],
+                   mid_r: &[f64],
+                   r2_l: &mut Option<Polyphase>,
+                   r2_r: &mut Option<Polyphase>,
+                   sink: &mut dyn FnMut(&[i32]),
+                   frames_out: &mut u64| {
+        let (out_l, out_r) = match (r2_l, r2_r) {
+            (Some(a), Some(b)) => (a.push(mid_l), b.push(mid_r)),
+            _ => (mid_l.to_vec(), mid_r.to_vec()),
+        };
+        let n = out_l.len().min(out_r.len());
+        let mut buf = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            buf.push(to_i32(out_l[i]));
+            buf.push(to_i32(out_r[i]));
+        }
+        *frames_out += n as u64;
+        sink(&buf);
+    };
+
+    while let Some(pair) = next_block()? {
+        let l_bytes: Vec<u8> = pair.iter().step_by(2).copied().collect();
+        let r_bytes: Vec<u8> = pair.iter().skip(1).step_by(2).copied().collect();
+        let mut bl = Vec::with_capacity(4096 * 8);
+        let mut br = Vec::with_capacity(4096 * 8);
+        expand_bits(&l_bytes, msb_first, &mut bl);
+        expand_bits(&r_bytes, msb_first, &mut br);
+        let mid_l = r1_l.push(&bl);
+        let mid_r = r1_r.push(&br);
+        process(
+            &mid_l,
+            &mid_r,
+            &mut r2_l,
+            &mut r2_r,
+            &mut sink,
+            &mut frames_out,
+        );
+    }
+    // flush both stages
+    let mid_l = r1_l.finish();
+    let mid_r = r1_r.finish();
+    process(
+        &mid_l,
+        &mid_r,
+        &mut r2_l,
+        &mut r2_r,
+        &mut sink,
+        &mut frames_out,
+    );
+    if let (Some(a), Some(b)) = (&mut r2_l, &mut r2_r) {
+        let out_l = a.finish();
+        let out_r = b.finish();
+        let n = out_l.len().min(out_r.len());
+        let mut buf = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            buf.push(to_i32(out_l[i]));
+            buf.push(to_i32(out_r[i]));
+        }
+        frames_out += n as u64;
+        sink(&buf);
+    }
+    Ok(frames_out)
+}
+
+// ---------- output sinks ----------
+
+trait PcmSink {
+    fn push(&mut self, samples: &[i32]) -> std::io::Result<()>;
+    fn finish(self: Box<Self>) -> std::io::Result<()>;
+}
+
+struct WavSink {
+    file: File,
+    bits: u8,
+    data_bytes: u64,
+}
+
+impl WavSink {
+    fn create(path: &Path, params: &PcmParams) -> std::io::Result<Self> {
+        let mut file = File::create(path)?;
+        let ch = 2u16;
+        let bits = params.bits as u16;
+        let block_align = ch * bits / 8;
+        let byte_rate = params.rate * block_align as u32;
+        let mut hdr = Vec::with_capacity(44);
+        hdr.extend_from_slice(b"RIFF");
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // patched at finish
+        hdr.extend_from_slice(b"WAVE");
+        hdr.extend_from_slice(b"fmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        hdr.extend_from_slice(&ch.to_le_bytes());
+        hdr.extend_from_slice(&params.rate.to_le_bytes());
+        hdr.extend_from_slice(&byte_rate.to_le_bytes());
+        hdr.extend_from_slice(&block_align.to_le_bytes());
+        hdr.extend_from_slice(&bits.to_le_bytes());
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // patched at finish
+        file.write_all(&hdr)?;
+        Ok(WavSink {
+            file,
+            bits: params.bits,
+            data_bytes: 0,
+        })
+    }
+}
+
+impl PcmSink for WavSink {
+    fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
+        let mut buf = Vec::with_capacity(samples.len() * self.bits as usize / 8);
+        for &s in samples {
+            if self.bits == 24 {
+                let v = (s >> 8) as u32 & 0xFF_FFFF;
+                buf.extend_from_slice(&v.to_le_bytes()[..3]);
+            } else {
+                buf.extend_from_slice(&(s >> 16).to_le_bytes());
+            }
+        }
+        self.data_bytes += buf.len() as u64;
+        self.file.write_all(&buf)
+    }
+
+    fn finish(mut self: Box<Self>) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(4))?;
+        self.file
+            .write_all(&((36 + self.data_bytes) as u32).to_le_bytes())?;
+        self.file.seek(SeekFrom::Start(40))?;
+        self.file
+            .write_all(&(self.data_bytes as u32).to_le_bytes())?;
+        self.file.flush()
+    }
+}
+
+struct FlacSink {
+    path: PathBuf,
+    bits: u8,
+    enc: rusty_flac::Encoder,
+}
+
+impl FlacSink {
+    fn create(path: &Path, params: &PcmParams) -> std::io::Result<Self> {
+        let enc = rusty_flac::Encoder::new(params.rate, 2, params.bits as u32)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+        Ok(FlacSink {
+            path: path.to_path_buf(),
+            bits: params.bits,
+            enc,
+        })
+    }
+}
+
+impl PcmSink for FlacSink {
+    fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
+        // shift full-scale i32 down to the target bit depth
+        let shift = if self.bits == 24 { 8 } else { 16 };
+        let v: Vec<i32> = samples.iter().map(|s| s >> shift).collect();
+        self.enc
+            .push_interleaved(&v)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        let bytes = self.enc.finish();
+        std::fs::write(&self.path, bytes)
+    }
+}
+
+struct WvSink {
+    path: PathBuf,
+    params: PcmParams,
+    buf: Vec<i32>,
+}
+
+impl WvSink {
+    fn create(path: &Path, params: PcmParams) -> Self {
+        WvSink {
+            path: path.to_path_buf(),
+            params,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl PcmSink for WvSink {
+    fn push(&mut self, samples: &[i32]) -> std::io::Result<()> {
+        let shift = if self.params.bits == 24 { 8 } else { 16 };
+        self.buf.extend(samples.iter().map(|s| s >> shift));
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> std::io::Result<()> {
+        let params = wavicle::EncodeParams {
+            channels: 2,
+            sample_rate: self.params.rate,
+            bits_per_sample: self.params.bits as u32,
+        };
+        let bytes = wavicle::encode_int(params, &self.buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")))?;
+        std::fs::write(&self.path, bytes)
+    }
+}
+
+fn make_sink(
+    path: &Path,
+    format: PcmFormat,
+    params: &PcmParams,
+) -> std::io::Result<Box<dyn PcmSink>> {
+    match format {
+        PcmFormat::Wav => Ok(Box::new(WavSink::create(path, params)?)),
+        PcmFormat::Flac => Ok(Box::new(FlacSink::create(path, params)?)),
+        PcmFormat::Wv => Ok(Box::new(WvSink::create(path, *params))),
+    }
+}
+
+// ---------- top-level entry points ----------
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Convert a single DSD file (DSF/DFF/DoP-WAV) to `out` (format from the
+/// output extension, or `format`). Returns output frames.
+pub fn convert_file(
+    input: &Path,
+    out: &Path,
+    format: Option<PcmFormat>,
+    params: &PcmParams,
+) -> Result<u64> {
+    let ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let info = match ext.as_str() {
+        "dff" => crate::dff::parse(input)?,
+        "wav" => crate::dop::parse(input)?,
+        _ => crate::dsf::parse(input)?,
+    };
+    let fmt = match out
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(PcmFormat::from_ext)
+    {
+        Some(f) => f,
+        None => format.ok_or_else(|| SacdError::NotDop {
+            path: out.to_path_buf(),
+            msg: "unknown output extension (use .wav/.flac/.wv or -f)".to_string(),
+        })?,
+    };
+    convert_dsf_info(&info, out, fmt, params)
+}
+
+/// Convert a DsfInfo (any packing) to a PCM file. Returns output frames.
+pub fn convert_dsf_info(
+    info: &DsfInfo,
+    out: &Path,
+    fmt: PcmFormat,
+    params: &PcmParams,
+) -> Result<u64> {
+    let io = |e: std::io::Error| SacdError::Io {
+        path: out.to_path_buf(),
+        source: e,
+    };
+    let mut reader = DsdBlockReader::open(info).map_err(|e| SacdError::Io {
+        path: info.path.clone(),
+        source: e,
+    })?;
+    let mut sink = make_sink(out, fmt, params).map_err(io)?;
+    let frames = convert_blocks(
+        || reader.next_block(),
+        !info.bit_reverse_needed,
+        info.sample_rate,
+        params,
+        |s| sink.push(s).unwrap(),
+    )
+    .map_err(io)?;
+    sink.finish().map_err(io)?;
+    Ok(frames)
+}
+
+/// Convert one ISO track. `IsoTrack.data` is already in DSF layout
+/// ([L 4096][R 4096] per 8192-byte block pair, LSB-first bit order).
+fn convert_iso_track(
+    track: &IsoTrack,
+    out: &Path,
+    fmt: PcmFormat,
+    params: &PcmParams,
+) -> Result<u64> {
+    let data = track.data.clone();
+    let mut pos = 0usize;
+    let mut sink = make_sink(out, fmt, params).map_err(|e| SacdError::Io {
+        path: out.to_path_buf(),
+        source: e,
+    })?;
+    let frames = convert_blocks(
+        || {
+            if pos >= data.len() {
+                return Ok(None);
+            }
+            let mut chunk = [0u8; SECTOR_PAIR_BYTES];
+            let n = SECTOR_PAIR_BYTES.min(data.len() - pos);
+            chunk[..n].copy_from_slice(&data[pos..pos + n]);
+            pos += n;
+            // de-interleave the DSF block pair into L0 R0 L1 R1 ...
+            let mut pair = [0u8; SECTOR_PAIR_BYTES];
+            for i in 0..SECTOR_PAIR_BYTES / 2 {
+                pair[2 * i] = chunk[i];
+                pair[2 * i + 1] = chunk[SECTOR_PAIR_BYTES / 2 + i];
+            }
+            Ok(Some(pair))
+        },
+        false, // DSF bit order = LSB first
+        DSD64,
+        params,
+        |s| sink.push(s).unwrap(),
+    )
+    .map_err(|e| SacdError::Io {
+        path: out.to_path_buf(),
+        source: e,
+    })?;
+    sink.finish().map_err(|e| SacdError::Io {
+        path: out.to_path_buf(),
+        source: e,
+    })?;
+    Ok(frames)
+}
+
+/// Convert a SACD-R ISO: one PCM file per track into directory `out_dir`.
+/// Returns total output frames.
+pub fn convert_iso(iso: &Path, out_dir: &Path, fmt: PcmFormat, params: &PcmParams) -> Result<u64> {
+    let img = iso_read::read_iso(iso).map_err(|e| SacdError::Io {
+        path: iso.to_path_buf(),
+        source: e,
+    })?;
+    std::fs::create_dir_all(out_dir).map_err(|e| SacdError::Io {
+        path: out_dir.to_path_buf(),
+        source: e,
+    })?;
+    let ext = fmt.ext();
+    let mut total = 0u64;
+    for (i, track) in img.tracks.iter().enumerate() {
+        let name = track
+            .title
+            .clone()
+            .unwrap_or_else(|| format!("track{:02}", i + 1));
+        let p = out_dir.join(format!("{:02} {}.{}", i + 1, sanitize_name(&name), ext));
+        total += convert_iso_track(track, &p, fmt, params)?;
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{make_test_dff, make_test_dop, pattern};
+    use std::io::Write;
+
+    fn test_params() -> PcmParams {
+        PcmParams {
+            rate: 96_000,
+            bits: 24,
+            lowpass: None,
+            gain_db: 0.0,
+        }
+    }
+
+    fn collect(info: &DsfInfo, params: &PcmParams) -> (Vec<i32>, u64) {
+        let mut reader = DsdBlockReader::open(info).unwrap();
+        let mut v = Vec::new();
+        let frames = convert_blocks(
+            || reader.next_block(),
+            !info.bit_reverse_needed,
+            info.sample_rate,
+            params,
+            |s| v.extend_from_slice(s),
+        )
+        .unwrap();
+        (v, frames)
+    }
+
+    /// Build a DSF whose data chunk is `data` (block-interleaved L/R blocks).
+    fn dsf_with_data(data: &[u8]) -> (tempfile::NamedTempFile, DsfInfo) {
+        let samples = (data.len() / 2) as u64 * 8;
+        let mut bytes = crate::testutil::make_test_dsf(samples, false);
+        let off = 92;
+        bytes[off..off + data.len()].copy_from_slice(data);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        let info = crate::dsf::parse_bytes(&bytes, f.path()).unwrap();
+        (f, info)
+    }
+
+    #[test]
+    fn dsf_dop_dff_produce_identical_pcm() {
+        let data = pattern(2 * 8192, 0xC0FFEE); // 2 block pairs
+        let (_f, dsf_info) = dsf_with_data(&data);
+
+        // equivalent DoP: byte-interleave L/R of the DSF block layout
+        let mut interleaved = Vec::with_capacity(data.len());
+        for block in 0..data.len() / 8192 {
+            let base = block * 8192;
+            for i in 0..4096 {
+                interleaved.push(data[base + i]); // L
+                interleaved.push(data[base + 4096 + i]); // R
+            }
+        }
+        let dop_bytes = make_test_dop(&interleaved, None);
+        let mut dop_file = tempfile::NamedTempFile::new().unwrap();
+        dop_file.write_all(&dop_bytes).unwrap();
+        let dop_info = crate::dop::parse_bytes(&dop_bytes, dop_file.path()).unwrap();
+
+        // equivalent DFF: same stream in native (bit-reversed) order
+        let native: Vec<u8> = data.iter().map(|b| b.reverse_bits()).collect();
+        let dff_bytes = make_test_dff(&native, None);
+        let mut dff_file = tempfile::NamedTempFile::new().unwrap();
+        dff_file.write_all(&dff_bytes).unwrap();
+        let dff_info = crate::dff::parse_bytes(&dff_bytes, dff_file.path()).unwrap();
+
+        let params = test_params();
+        let (a, fa) = collect(&dsf_info, &params);
+        let (b, fb) = collect(&dop_info, &params);
+        let (c, fc) = collect(&dff_info, &params);
+        assert_eq!(fa, fb);
+        assert_eq!(fa, fc);
+        assert_eq!(a, b, "DSF vs DoP PCM mismatch");
+        assert_eq!(a, c, "DSF vs DFF PCM mismatch");
+        assert!(!a.is_empty());
+        // 2 block pairs = 65536 samples/ch -> 65536*96000/2822400 = 2228 frames (+ tail)
+        assert!((2228..2228 + 3000).contains(&fa), "frames {fa}");
+    }
+
+    fn parse_wav(path: &Path) -> (u32, u16, u16, u16, Vec<u8>) {
+        let b = std::fs::read(path).unwrap();
+        assert_eq!(&b[0..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        assert_eq!(&b[12..16], b"fmt ");
+        let tag = u16::from_le_bytes([b[20], b[21]]);
+        let ch = u16::from_le_bytes([b[22], b[23]]);
+        let rate = u32::from_le_bytes([b[24], b[25], b[26], b[27]]);
+        let bits = u16::from_le_bytes([b[34], b[35]]);
+        assert_eq!(&b[36..40], b"data");
+        let data_size = u32::from_le_bytes([b[40], b[41], b[42], b[43]]) as usize;
+        let riff_size = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+        assert_eq!(riff_size, 36 + data_size);
+        assert_eq!(b.len(), 44 + data_size);
+        (rate, ch, bits, tag, b[44..].to_vec())
+    }
+
+    #[test]
+    fn wav_output_is_well_formed() {
+        let data = pattern(8192, 42);
+        let (_f, info) = dsf_with_data(&data);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = test_params();
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Wav, &params).unwrap();
+        let (rate, ch, bits, tag, pcm) = parse_wav(&out_path);
+        assert_eq!(tag, 1);
+        assert_eq!(ch, 2);
+        assert_eq!(rate, 96_000);
+        assert_eq!(bits, 24);
+        assert_eq!(pcm.len(), frames as usize * 2 * 3);
+        // 8192 bytes = 32768 samples/ch -> 1114 frames at 96k (+ filter tail)
+        assert!((1114..1114 + 2000).contains(&frames), "frames {frames}");
+    }
+
+    #[test]
+    fn flac_output_roundtrips_rusty_and_claxon() {
+        let data = pattern(8192, 7);
+        let (_f, info) = dsf_with_data(&data);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = test_params();
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Flac, &params).unwrap();
+
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(&bytes[0..4], b"fLaC");
+        // rusty_flac decode (planar)
+        let (si, planes) = rusty_flac::decode(&bytes).unwrap();
+        assert_eq!(si.sample_rate, 96_000);
+        assert_eq!(si.channels, 2);
+        assert_eq!(si.bits_per_sample, 24);
+        let n = planes[0].len();
+        assert!((n as i64 - frames as i64).abs() < 64);
+        let mut interleaved = Vec::with_capacity(n * 2);
+        for (l, r) in planes[0].iter().zip(&planes[1]) {
+            interleaved.push(*l);
+            interleaved.push(*r);
+        }
+        // claxon cross-decode (independent implementation)
+        let mut reader = claxon::FlacReader::open(&out_path).unwrap();
+        let claxon_samples: Vec<i32> = reader.samples().map(|s| s.unwrap()).collect();
+        assert_eq!(claxon_samples.len(), interleaved.len());
+        assert_eq!(claxon_samples, interleaved, "claxon decode mismatch");
+    }
+
+    #[test]
+    fn wavpack_output_roundtrips_16bit() {
+        let data = pattern(8192, 99);
+        let (_f, info) = dsf_with_data(&data);
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().to_path_buf();
+        let params = PcmParams {
+            rate: 48_000,
+            bits: 16,
+            lowpass: None,
+            gain_db: 0.0,
+        };
+        let frames = convert_dsf_info(&info, &out_path, PcmFormat::Wv, &params).unwrap();
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(&bytes[0..4], b"wvpk");
+        let dec = wavicle::decode_stream(&bytes).unwrap();
+        assert_eq!(dec.sample_rate, 48_000);
+        assert_eq!(dec.channels, 2);
+        assert_eq!(dec.bits_per_sample, 16);
+        assert!((dec.samples.len() as i64 / 2 - frames as i64).abs() < 64);
+    }
+
+    #[test]
+    fn iso_input_matches_dsf_input() {
+        let data = pattern(8192, 1234);
+        let (dsf_file, info) = dsf_with_data(&data);
+        let params = test_params();
+        let (direct, frames_direct) = collect(&info, &params);
+
+        let iso_file = tempfile::NamedTempFile::new().unwrap();
+        crate::image::build_image(std::slice::from_ref(&info), iso_file.path()).unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let frames_iso =
+            convert_iso(iso_file.path(), out_dir.path(), PcmFormat::Wav, &params).unwrap();
+        // the ISO track is padded to a whole SACD frame (9408 > 8192 bytes), so
+        // it may emit a few more (zero-padding ring-out) frames than the DSF
+        assert!(frames_iso >= frames_direct);
+        let entries: Vec<_> = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let (_rate, _ch, _bits, _tag, pcm) = parse_wav(&entries[0]);
+        // direct sink produced full-scale i32; WAV stores 24-bit (>>8)
+        let direct24: Vec<u8> = direct
+            .iter()
+            .flat_map(|s| {
+                let v = (*s >> 8) as u32 & 0xFF_FFFF;
+                v.to_le_bytes()[..3].to_vec()
+            })
+            .collect();
+        let n = (frames_direct as usize) * 6; // compare the common prefix
+        assert_eq!(&pcm[..n], &direct24[..n], "ISO vs DSF PCM prefix mismatch");
+        drop(dsf_file);
+    }
+}

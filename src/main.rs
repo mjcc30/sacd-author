@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use sacd_author::{data_iso, dff, dop, dsf, dsf_write, image, iso_read};
+use sacd_author::{data_iso, dff, dop, dsd2pcm, dsf, dsf_write, image, iso_read};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -48,6 +48,32 @@ enum Commands {
         inputs: Vec<PathBuf>,
         #[arg(short, long, default_value = "data.iso")]
         output: PathBuf,
+    },
+    /// Convert DSD (DSF/DFF/DoP-WAV file, or a SACD-R ISO) to PCM: WAV, FLAC
+    /// or WavPack. With an .iso input, -o is a directory (one file per track).
+    #[command(name = "dsd2pcm")]
+    Dsd2Pcm {
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+        /// Output file (single input) or directory (ISO input)
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Target PCM sample rate
+        #[arg(short = 'r', long, default_value = "96000")]
+        rate: u32,
+        /// Bit depth: 16 or 24
+        #[arg(short = 'b', long, default_value = "24")]
+        bits: u8,
+        /// Low-pass cutoff in Hz (default: min(50000, 0.45*rate))
+        #[arg(long)]
+        lowpass: Option<u32>,
+        /// Gain in dB applied after filtering (default +6 dB)
+        #[arg(long, default_value = "6.0")]
+        gain: f64,
+        /// Output format when it can't be guessed from the output extension
+        /// (flac, wav, wv); used as-is for ISO inputs
+        #[arg(short = 'f', long, default_value = "flac")]
+        format: String,
     },
 }
 
@@ -202,6 +228,69 @@ fn data_iso_cmd(inputs: &[PathBuf], output: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn dsd2pcm_cmd(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    rate: u32,
+    bits: u8,
+    lowpass: Option<u32>,
+    gain: f64,
+    format: &str,
+) -> Result<()> {
+    if !dsd2pcm::supported_rate(rate) {
+        anyhow::bail!(
+            "unsupported rate {rate} (use 44100/48000/88200/96000/176400/192000/352800/384000)"
+        );
+    }
+    if !matches!(bits, 16 | 24) {
+        anyhow::bail!("unsupported bit depth {bits} (use 16 or 24)");
+    }
+    let fmt = dsd2pcm::PcmFormat::from_ext(format)
+        .ok_or_else(|| anyhow::anyhow!("unknown format '{format}' (use flac, wav or wv)"))?;
+    let params = dsd2pcm::PcmParams {
+        rate,
+        bits,
+        lowpass: lowpass.map(|h| h as f64),
+        gain_db: gain,
+    };
+    let is_iso = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("iso"))
+        .unwrap_or(false);
+    println!(
+        "{}: DSD64 -> PCM {} Hz, {} bit, lowpass {} Hz, gain {:+.1} dB",
+        input.display(),
+        rate,
+        bits,
+        params
+            .lowpass
+            .map(|h| h as u32)
+            .unwrap_or(50_000.min((0.45 * rate as f64) as u32)),
+        gain
+    );
+    if is_iso {
+        let frames = dsd2pcm::convert_iso(input, output, fmt, &params)?;
+        println!(
+            "done: {} frame(s) at {} Hz ({:.2}s) into {}",
+            frames,
+            rate,
+            frames as f64 / rate as f64,
+            output.display()
+        );
+    } else {
+        let frames = dsd2pcm::convert_file(input, output, Some(fmt), &params)?;
+        println!(
+            "done: {} -> {} frame(s) at {} Hz ({:.2}s)",
+            input.display(),
+            frames,
+            rate,
+            frames as f64 / rate as f64
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -212,6 +301,15 @@ fn main() -> Result<()> {
             format,
         }) => extract(&iso, &output, &format),
         Some(Commands::DataIso { inputs, output }) => data_iso_cmd(&inputs, &output),
+        Some(Commands::Dsd2Pcm {
+            input,
+            output,
+            rate,
+            bits,
+            lowpass,
+            gain,
+            format,
+        }) => dsd2pcm_cmd(&input, &output, rate, bits, lowpass, gain, &format),
         None => {
             if cli.inputs.is_empty() {
                 Cli::parse_from(["sacd-author", "--help"]);

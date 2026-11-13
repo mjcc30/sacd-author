@@ -35,7 +35,22 @@ sacd-author extract album.iso -o extracted_dff/ -f dff    # DFF
 # any modern player (Sony BDP-S490 plays FLAC 24/96 from disc) — ISO 9660
 # + Joliet, real file names preserved
 sacd-author data-iso track01.flac track02.flac ... -o music.iso
+
+# DSD -> PCM conversion (two-stage Kaiser FIR low-pass, default +6 dB gain)
+# input: .dsf / .dff / DoP .wav file, or a SACD-R .iso (then -o is a directory,
+# one output file per track); output format from the extension (.wav/.flac/.wv)
+sacd-author dsd2pcm track01.dsf -o track01.flac -r 96000 -b 24
+sacd-author dsd2pcm album.iso  -o album_pcm/ -f flac -r 176400   # max fidelity
+sacd-author dsd2pcm track.wv    # via -f or output extension .wv (WavPack)
 ```
+
+Notes on `dsd2pcm`: the DSD noise shaper puts huge ultrasonic noise above
+~20-30 kHz, so the anti-alias low-pass (default: min(50 kHz, 0.45 x rate),
+override with `--lowpass`) runs before decimation — without it that noise
+aliases into the audible band. Inside 20 Hz-20 kHz the conversion is
+transparent; only ultrasonic noise is removed. Use `-b 24` (16-bit loses
+dynamic range) and `-r 176400`/`192000` if you want to keep content up to
+~80-90 kHz; 24/96 is enough for audible transparency and for the BDP-S490.
 
 Burn examples: `growisofs -dvd-compat -Z /dev/sr0=music.iso` (Linux/WSL),
 ImgBurn or `xorriso -as cdrecord` on Windows.
