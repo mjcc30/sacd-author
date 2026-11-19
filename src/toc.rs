@@ -17,7 +17,7 @@
 //! - 0x044  4   area_1_toc_2_start (LSN)
 //! - 0x048  4   area_2_toc_1_start (LSN)
 //! - 0x04C  4   area_2_toc_2_start (LSN)
-//! - 0x050  1   disc_type (bit 7 = hybrid, big-endian bitfield)
+//! - 0x050  1   disc_type (bit 7 = hybrid; we write 0: a DVD-R SACD-R has no CD layer)
 //! - 0x051  3   reserved
 //! - 0x054  2   area_1_toc_size (sectors)
 //! - 0x056  2   area_2_toc_size (sectors)
@@ -57,8 +57,9 @@
 //! - 0x050  1   text_area_count
 //! - 0x051  7   reserved
 //! - 0x058  40  languages[10]
-//! - 0x080  2   track_text_offset
-//! - 0x082  2   index_list_offset
+//! - 0x080  16  reserved (libsacd calls 0x80/0x82/0x84 track_text/index/access
+//!   list offsets, but spec 03 marks 0x80-0x8F reserved and the conforming
+//!   corpus writes zeros; sub-structures are located by signature walk 3.7)
 //! - 0x084  2   access_list_offset
 //! - 0x086  10  reserved
 //! - 0x090  2   area_description_offset
@@ -93,8 +94,10 @@ pub const SACD_FRAME_RATE: u32 = 75;
 pub const VERSION_MAJOR: u8 = 1;
 pub const VERSION_MINOR: u8 = 0x14;
 pub const SAMPLE_FREQUENCY_DSD64: u8 = 0x04;
-pub const MAX_BYTE_RATE_DSD64_STEREO: u32 = 337_920; // observed on commercial SACD area TOC
+pub const MAX_BYTE_RATE_DSD64_STEREO: u32 = 705_600; // 2 ch x 2822400 Hz / 8; matches the conforming corpus
 pub const DISC_TYPE_HYBRID: u8 = 0x80;
+/// A SACD-R on DVD-R has no CD layer, so the hybrid bit must stay clear.
+pub const DISC_TYPE_SACD_R: u8 = 0x00;
 
 #[binrw]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,7 +192,7 @@ impl MasterToc {
             area_1_toc_2_start: area1_toc2,
             area_2_toc_1_start: 0,
             area_2_toc_2_start: 0,
-            disc_type: DISC_TYPE_HYBRID,
+            disc_type: DISC_TYPE_SACD_R,
             reserved04: [0; 3],
             area_1_toc_size: area1_size,
             area_2_toc_size: 0,
@@ -547,8 +550,8 @@ pub fn build_area_toc(
         text_area_count: 1,
         reserved09: [0; 7],
         languages,
-        track_text_offset: if texts.is_empty() { 0 } else { 1 },
-        index_list_offset: 2,
+        track_text_offset: 0, // reserved per spec 03 (0x80-0x8F); corpus writes 0
+        index_list_offset: 0,
         access_list_offset: 0,
         reserved10: [0; 10],
         area_description_offset: 0,
@@ -599,7 +602,7 @@ mod tests {
         assert_eq!(bytes[0x09], 0x14);
         assert_eq!(&bytes[0x40..0x44], &540u32.to_be_bytes());
         assert_eq!(&bytes[0x44..0x48], &556u32.to_be_bytes());
-        assert_eq!(bytes[0x50], DISC_TYPE_HYBRID);
+        assert_eq!(bytes[0x50], DISC_TYPE_SACD_R); // not hybrid: no CD layer on DVD-R
         assert_eq!(&bytes[0x54..0x56], &6u16.to_be_bytes());
         assert_eq!(bytes[0x80], 1); // text_area_count
         assert_eq!(&bytes[0x88..0x8C], &b"en\x01\x00"[..]); // one locale
@@ -635,7 +638,7 @@ mod tests {
         assert_eq!(bytes.len(), AREA_TOC_SECTORS as usize * SECTOR_SIZE);
         assert_eq!(&bytes[0x000..0x008], b"TWOCHTOC");
         assert_eq!(&bytes[0x00A..0x00C], &6u16.to_be_bytes()); // size
-        assert_eq!(&bytes[0x010..0x014], &337920u32.to_be_bytes());
+        assert_eq!(&bytes[0x010..0x014], &705600u32.to_be_bytes());
         assert_eq!(bytes[0x014], 0x04);
         assert_eq!(bytes[0x015] & 0x0F, FRAME_FORMAT_DSD_3IN14); // plain DSD, not DST
         assert_eq!(bytes[0x020], 2); // channel_count
@@ -645,8 +648,7 @@ mod tests {
         assert_eq!(bytes[0x050], 1); // text_area_count
         assert_eq!(&bytes[0x58..0x5C], &b"en\x01\x00"[..]); // one locale
         assert!(bytes[0x5C..0x80].iter().all(|&b| b == 0));
-        assert_eq!(&bytes[0x80..0x82], &0u16.to_be_bytes()); // no track text here
-        assert_eq!(&bytes[0x82..0x84], &2u16.to_be_bytes()); // index list at sector 2
+        assert_eq!(&bytes[0x80..0x84], &[0u8; 4]); // reserved 0x80-0x8F, corpus writes zeros
         // total playtime = 225 frames = 3 s
         assert_eq!(&bytes[0x40..0x43], &[0, 3, 0]);
         // sector layout: header, (empty TTxt), IGL x2, TRL1, TRL2
